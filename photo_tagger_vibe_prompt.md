@@ -210,7 +210,7 @@ CREATE INDEX idx_photo_sort_path ON photo_entries(relative_dir);
 - `is_missing` 表示整个历史照片组在最近一次成功扫描中未找到；
 - EXIF 字段来自 JPEG，只读入库，不回写 JPEG 或 ARW；旧项目在打开时自动迁移；
 - `date_group` 按拍摄日期生成，`location_group` 将 GPS 坐标按约 1 公里网格归类；
-- `perceptual_hash` 用于在拍摄时间相差 10 分钟内识别高度相似照片，命中后写入稳定的 `similarity_group`；
+- `perceptual_hash` 用于在最长 30 秒的连续拍摄窗口内识别高度相似照片；新成员必须与组内每张照片的哈希距离都不超过阈值，禁止通过 A≈B、B≈C 的关系将实际不相似的 A 与 C 传递合并；命中后写入稳定的 `similarity_group`；
 - 相似组是照片浏览的固有上下文，不属于智能筛选项；选择组内照片时在预览区右侧显示完整组；
 - 用户可将组内照片从主列表隐藏，状态写入 `is_similarity_hidden`。隐藏照片仍可在相似组侧栏查看和恢复，并且每组至少保留一个未隐藏成员作为入口；
 - `is_trashed` 是独立于 `tag_id` 的内置待删除状态；移入回收站时保留原标签，恢复后回到原标签，且绝不删除源文件；

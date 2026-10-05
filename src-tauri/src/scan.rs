@@ -726,6 +726,50 @@ fn timestamp_seconds(value: &str) -> Option<i64> {
     Some(days * 86_400 + values[3] * 3_600 + values[4] * 60 + values[5])
 }
 
+const SIMILARITY_TIME_WINDOW_SECONDS: i64 = 30;
+const SIMILARITY_HASH_DISTANCE: u32 = 7;
+
+fn similarity_clusters(photos: &[(i64, String, u64)]) -> Vec<Vec<i64>> {
+    let timed = photos
+        .iter()
+        .filter_map(|(id, captured_at, hash)| {
+            timestamp_seconds(captured_at).map(|time| (*id, time, *hash))
+        })
+        .collect::<Vec<_>>();
+    let mut clusters: Vec<Vec<(i64, i64, u64)>> = Vec::new();
+
+    for photo in timed {
+        let mut best: Option<(usize, u32)> = None;
+        for index in (0..clusters.len()).rev() {
+            let cluster = &clusters[index];
+            if photo.1 - cluster[0].1 > SIMILARITY_TIME_WINDOW_SECONDS {
+                break;
+            }
+            let maximum_distance = cluster
+                .iter()
+                .map(|member| (photo.2 ^ member.2).count_ones())
+                .max()
+                .unwrap_or(u32::MAX);
+            if maximum_distance <= SIMILARITY_HASH_DISTANCE
+                && best.is_none_or(|(_, best_distance)| maximum_distance < best_distance)
+            {
+                best = Some((index, maximum_distance));
+            }
+        }
+        if let Some((index, _)) = best {
+            clusters[index].push(photo);
+        } else {
+            clusters.push(vec![photo]);
+        }
+    }
+
+    clusters
+        .into_iter()
+        .filter(|cluster| cluster.len() > 1)
+        .map(|cluster| cluster.into_iter().map(|photo| photo.0).collect())
+        .collect()
+}
+
 fn refresh_smart_groups(transaction: &Transaction<'_>) -> AppResult<()> {
     transaction.execute(
         "UPDATE photo_entries SET date_group=CASE WHEN captured_at IS NULL THEN NULL ELSE substr(captured_at,1,10) END,
@@ -748,44 +792,11 @@ fn refresh_smart_groups(transaction: &Transaction<'_>) -> AppResult<()> {
         })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
-    let mut parent: Vec<usize> = (0..photos.len()).collect();
-    fn root(parent: &mut [usize], mut value: usize) -> usize {
-        while parent[value] != value {
-            parent[value] = parent[parent[value]];
-            value = parent[value];
-        }
-        value
-    }
-    for current in 0..photos.len() {
-        let Some(current_time) = timestamp_seconds(&photos[current].1) else {
-            continue;
-        };
-        for previous in (0..current).rev() {
-            let Some(previous_time) = timestamp_seconds(&photos[previous].1) else {
-                continue;
-            };
-            if current_time - previous_time > 10 * 60 {
-                break;
-            }
-            if (photos[current].2 ^ photos[previous].2).count_ones() <= 8 {
-                let current_root = root(&mut parent, current);
-                let previous_root = root(&mut parent, previous);
-                if current_root != previous_root {
-                    parent[current_root] = previous_root;
-                }
-            }
-        }
-    }
-    let mut groups: BTreeMap<usize, Vec<i64>> = BTreeMap::new();
-    for (index, photo) in photos.iter().enumerate() {
-        let group_root = root(&mut parent, index);
-        groups.entry(group_root).or_default().push(photo.0);
-    }
     let mut group_number = 0;
-    for ids in groups.values().filter(|ids| ids.len() > 1) {
+    for ids in similarity_clusters(&photos) {
         group_number += 1;
         let label = format!("相似组 {group_number:03}");
-        for id in ids {
+        for id in &ids {
             transaction.execute(
                 "UPDATE photo_entries SET similarity_group=?1 WHERE id=?2",
                 params![label, id],
@@ -1027,6 +1038,28 @@ mod tests {
             60
         );
         assert!(timestamp_seconds("not a date").is_none());
+    }
+
+    #[test]
+    fn similarity_clusters_do_not_merge_through_transitive_matches() {
+        let photos = vec![
+            (1, "2026-10-05 12:00:00".into(), 0_u64),
+            (2, "2026-10-05 12:00:01".into(), 0x0f_u64),
+            (3, "2026-10-05 12:00:02".into(), 0xff_u64),
+        ];
+
+        assert_eq!(similarity_clusters(&photos), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn similarity_clusters_require_a_short_capture_window() {
+        let photos = vec![
+            (1, "2026-10-05 12:00:00".into(), 0_u64),
+            (2, "2026-10-05 12:00:30".into(), 0_u64),
+            (3, "2026-10-05 12:01:01".into(), 0_u64),
+        ];
+
+        assert_eq!(similarity_clusters(&photos), vec![vec![1, 2]]);
     }
 
     #[test]
