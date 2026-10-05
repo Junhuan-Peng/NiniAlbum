@@ -30,6 +30,22 @@ export interface PhotoEntry {
   rawRelativePath: string | null;
   modifiedTime: number | null;
   thumbnailDataUrl: string | null;
+  pixelWidth: number | null;
+  pixelHeight: number | null;
+  orientation: number | null;
+  capturedAt: string | null;
+  cameraMake: string | null;
+  cameraModel: string | null;
+  lensModel: string | null;
+  exposureTime: string | null;
+  aperture: string | null;
+  iso: number | null;
+  focalLength: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  dateGroup: string | null;
+  locationGroup: string | null;
+  similarityGroup: string | null;
 }
 
 export interface ProjectCounts { total: number; tagged: number; missing: number; conflicts: number; incomplete: number; }

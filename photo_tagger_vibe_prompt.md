@@ -98,7 +98,7 @@ CREATE TABLE project_settings (
     )),
   sort_direction TEXT NOT NULL DEFAULT 'asc'
     CHECK (sort_direction IN ('asc', 'desc')),
-  schema_version INTEGER NOT NULL DEFAULT 1,
+  schema_version INTEGER NOT NULL DEFAULT 2,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -165,6 +165,23 @@ CREATE TABLE photo_entries (
   tag_id INTEGER NULL REFERENCES tag_tree(id) ON DELETE RESTRICT,
   thumbnail_blob BLOB NULL,
   thumbnail_mime TEXT NULL,
+  pixel_width INTEGER NULL,
+  pixel_height INTEGER NULL,
+  orientation INTEGER NULL,
+  captured_at TEXT NULL,
+  camera_make TEXT NULL,
+  camera_model TEXT NULL,
+  lens_model TEXT NULL,
+  exposure_time TEXT NULL,
+  aperture TEXT NULL,
+  iso INTEGER NULL,
+  focal_length TEXT NULL,
+  latitude REAL NULL,
+  longitude REAL NULL,
+  perceptual_hash INTEGER NULL,
+  date_group TEXT NULL,
+  location_group TEXT NULL,
+  similarity_group TEXT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(relative_dir, pairing_key)
@@ -181,6 +198,9 @@ CREATE INDEX idx_photo_sort_path ON photo_entries(relative_dir);
 - `display_base_name` 保留用于 UI 展示的原始主文件名；
 - `pair_status` 描述配对完整性；
 - `is_missing` 表示整个历史照片组在最近一次成功扫描中未找到；
+- EXIF 字段来自 JPEG，只读入库，不回写 JPEG 或 ARW；旧项目在打开时自动迁移；
+- `date_group` 按拍摄日期生成，`location_group` 将 GPS 坐标按约 1 公里网格归类；
+- `perceptual_hash` 用于在拍摄时间相差 10 分钟内识别高度相似照片，命中后写入稳定的 `similarity_group`；
 - 配对状态与丢失状态相互独立，例如历史上完整配对的照片组移动失败后可以是 `complete + is_missing=1`。
 
 ### 4.5 `photo_files`：照片组内的实际文件
