@@ -6,6 +6,8 @@ import type {
 export const api = {
   createProject: (databasePath: string, photoRoot: string) =>
     invoke<ProjectInfo>('create_project', { databasePath, photoRoot }),
+  replaceProject: (databasePath: string, photoRoot: string) =>
+    invoke<ProjectInfo>('replace_project', { databasePath, photoRoot }),
   openProject: (databasePath: string) => invoke<ProjectInfo>('open_project', { databasePath }),
   snapshot: (query?: PhotoQuery) => invoke<ProjectSnapshot>('get_snapshot', { query }),
   scan: () => invoke<ScanSummary>('scan_project'),

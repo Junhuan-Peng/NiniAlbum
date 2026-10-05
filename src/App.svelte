@@ -22,12 +22,16 @@
   let previewLoading = false;
   let scanProgress: ScanProgress | null = null;
   let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  let panning = false;
   let leftWidth = 248;
   let rightWidth = 310;
   let tagDialog: 'root' | 'child' | 'rename' | null = null;
   let tagName = '';
   let deleteDialog: { tag: TagNode; impact: DeleteImpact } | null = null;
   let exportDialog: { root: string; plan: ExportPlan; strategy: 'skip' | 'overwrite' | 'rename' } | null = null;
+  let existingProjectDialog: { databasePath: string; photoRoot: string } | null = null;
   let recentProjects: { path: string; name: string; photoRoot: string; lastOpened: number }[] = [];
   let smartKind: 'none' | 'date' | 'location' | 'similarity' = 'none';
   let smartGroup = '';
@@ -55,6 +59,17 @@
 
   function projectName(path: string) {
     return path.split(/[\\/]/).pop()?.replace(/\.sqlite$/i, '') || '未命名项目';
+  }
+
+  function thumbnailStyle(photo: PhotoEntry) {
+    const width = photo.pixelWidth ?? 4;
+    const height = photo.pixelHeight ?? 3;
+    const ratio = Math.max(0.45, Math.min(2.2, width / height));
+    const longEdge = 76;
+    const shortEdge = Math.max(42, Math.round(longEdge / Math.max(ratio, 1 / ratio)));
+    return ratio >= 1
+      ? `width:${longEdge}px;height:${shortEdge}px`
+      : `width:${shortEdge}px;height:${longEdge}px`;
   }
 
   function rememberProject(path: string, photoRoot: string) {
@@ -101,11 +116,31 @@
     let databasePath = await save({ title: '保存项目数据库', defaultPath: 'nini-albums.sqlite', filters: [{ name: 'SQLite 项目', extensions: ['sqlite'] }] });
     if (!databasePath) return;
     if (!databasePath.toLowerCase().endsWith('.sqlite')) databasePath += '.sqlite';
-    await runBusy('正在创建项目…', async () => {
-      await api.createProject(databasePath!, photoRoot);
+    busy = true; busyLabel = '正在创建项目…';
+    try {
+      await api.createProject(databasePath, photoRoot);
       filter = 'all'; selectedIndex = 0; await refresh();
-      rememberProject(databasePath!, photoRoot);
+      rememberProject(databasePath, photoRoot);
       toast('项目已创建，可以开始扫描照片。', 'success');
+    } catch (error) {
+      const message = errorMessage(error);
+      if (message.includes('项目数据库已存在')) existingProjectDialog = { databasePath, photoRoot };
+      else toast(message, 'error', 6000);
+    } finally { busy = false; busyLabel = ''; }
+  }
+
+  async function resolveExistingProject(action: 'upgrade' | 'overwrite') {
+    if (!existingProjectDialog) return;
+    const { databasePath, photoRoot } = existingProjectDialog;
+    existingProjectDialog = null;
+    await runBusy(action === 'upgrade' ? '正在升级项目…' : '正在覆盖项目…', async () => {
+      const info = action === 'upgrade'
+        ? await api.openProject(databasePath)
+        : await api.replaceProject(databasePath, photoRoot);
+      filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
+      await refresh();
+      rememberProject(databasePath, info.photoRoot);
+      toast(action === 'upgrade' ? '旧项目已升级并打开，原有标签和索引已保留。' : '旧项目已覆盖，照片原文件未被修改。', 'success', 6000);
     });
   }
 
@@ -152,7 +187,7 @@
   }
 
   async function loadPreview(photo: PhotoEntry | null) {
-    previewData = null; zoom = 1;
+    previewData = null; resetPreview();
     if (!photo?.jpegRelativePath || photo.isMissing || photo.pairStatus === 'conflict') return;
     const requested = photo.id; previewLoading = true;
     try { const data = await api.preview(requested); if (currentPhoto?.id === requested) previewData = data; }
@@ -240,7 +275,10 @@
     const target = event.target as HTMLElement;
     if (['INPUT','TEXTAREA','SELECT'].includes(target.tagName) || target.isContentEditable) return;
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); syncProject(); return; }
-    if (!snapshot || tagDialog || deleteDialog || exportDialog) return;
+    if (!snapshot || tagDialog || deleteDialog || exportDialog || existingProjectDialog) return;
+    if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
+    if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
+    if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
     if (event.key === 'ArrowDown') { event.preventDefault(); choosePhoto(Math.min(selectedIndex + 1, photos.length - 1)); }
     if (event.key === 'ArrowUp') { event.preventDefault(); choosePhoto(Math.max(selectedIndex - 1, 0)); }
     if (event.code === 'Space' && selectedTagId !== null) { event.preventDefault(); assignSelectedTag(selectedTagId, true); }
@@ -259,7 +297,39 @@
 
   function zoomPreview(event: WheelEvent) {
     if (!previewData) return;
-    event.preventDefault(); zoom = Math.max(.2, Math.min(6, zoom * (event.deltaY < 0 ? 1.12 : .89)));
+    event.preventDefault(); zoomBy(event.deltaY < 0 ? 1.12 : .89);
+  }
+
+  function zoomBy(factor: number) {
+    zoom = Math.max(0.2, Math.min(8, zoom * factor));
+    if (zoom <= 1) { panX = 0; panY = 0; }
+  }
+
+  function resetPreview() {
+    zoom = 1; panX = 0; panY = 0; panning = false;
+  }
+
+  function startPan(event: PointerEvent) {
+    if (!previewData || zoom <= 1 || event.button !== 0) return;
+    event.preventDefault();
+    panning = true;
+    const startX = event.clientX; const startY = event.clientY;
+    const initialX = panX; const initialY = panY;
+    const target = event.currentTarget as HTMLElement;
+    target.setPointerCapture(event.pointerId);
+    const move = (next: PointerEvent) => {
+      panX = initialX + next.clientX - startX;
+      panY = initialY + next.clientY - startY;
+    };
+    const stop = () => {
+      panning = false;
+      target.removeEventListener('pointermove', move);
+      target.removeEventListener('pointerup', stop);
+      target.removeEventListener('pointercancel', stop);
+    };
+    target.addEventListener('pointermove', move);
+    target.addEventListener('pointerup', stop);
+    target.addEventListener('pointercancel', stop);
   }
 
   function focusOnMount(node: HTMLElement) {
@@ -320,8 +390,8 @@
         </div>
         <div class="min-h-0 flex-1 overflow-y-auto p-1.5">
           {#each photos as photo, index (photo.id)}
-            <button class:active={index === selectedIndex} class="mb-1 flex w-full gap-2 rounded-lg border border-transparent p-1.5 text-left hover:bg-white/5" on:click={() => choosePhoto(index)}>
-              <div class="grid h-14 w-16 shrink-0 place-items-center overflow-hidden rounded bg-[#0d0e10] text-[10px] text-muted">{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt="" class="h-full w-full object-contain" />{:else}{photo.isMissing ? '丢失' : photo.pairStatus === 'conflict' ? '冲突' : 'RAW'}{/if}</div>
+            <button class:active={index === selectedIndex} class="mb-1 flex min-h-[88px] w-full items-center gap-3 rounded-lg border border-transparent p-2 text-left hover:bg-white/5" on:click={() => choosePhoto(index)}>
+              <div class="grid shrink-0 place-items-center overflow-hidden rounded-md bg-[#0d0e10] text-[10px] text-muted shadow-sm" style={thumbnailStyle(photo)}>{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt="" class="h-full w-full object-cover" />{:else}{photo.isMissing ? '丢失' : photo.pairStatus === 'conflict' ? '冲突' : 'RAW'}{/if}</div>
               <div class="min-w-0 flex-1 py-0.5"><div class="truncate text-xs font-medium">{photo.displayBaseName}</div><div class="mt-1 truncate text-[10px] text-muted">{photo.relativeDir || '根目录'}</div><div class="mt-1 flex items-center gap-1 text-[9px]">{#if photo.isMissing}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">丢失</span>{:else if photo.pairStatus === 'conflict'}<span class="rounded bg-amber-400/15 px-1.5 py-0.5 text-amber-300">冲突</span>{:else if photo.pairStatus !== 'complete'}<span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-sky-300">缺配对</span>{/if}{#if photo.tagId}<span class="truncate rounded bg-accent/10 px-1.5 py-0.5 text-accent">{photo.tagPath}</span>{/if}</div></div>
             </button>
           {:else}<div class="p-5 text-center text-xs text-muted">当前筛选没有照片</div>{/each}
@@ -329,11 +399,11 @@
       </aside>
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('left', event)} aria-label="调整缩略图面板宽度"></button>
       <section class="relative min-w-0 overflow-hidden bg-[#0b0c0e]" on:wheel={zoomPreview}>
-        {#if previewData}<div class="grid h-full w-full place-items-center overflow-auto p-8"><img src={previewData} alt={currentPhoto?.displayBaseName} class="max-h-full max-w-full select-none object-contain shadow-2xl transition-transform duration-100" draggable="false" style={`transform:scale(${zoom})`} /></div>
+        {#if previewData}<div role="application" aria-label="图片预览：滚轮或按钮缩放，放大后拖拽，双击复位" class:cursor-grabbing={panning} class:cursor-grab={!panning} class="grid h-full w-full touch-none place-items-center overflow-hidden p-8" on:pointerdown={startPan} on:dblclick={resetPreview}><img src={previewData} alt={currentPhoto?.displayBaseName} class="max-h-full max-w-full select-none object-contain shadow-2xl" draggable="false" style={`transform:translate(${panX}px,${panY}px) scale(${zoom});transform-origin:center`} /></div>
         {:else if previewLoading}<div class="grid h-full place-items-center text-sm text-muted">正在加载 JPEG 预览…</div>
         {:else if currentPhoto}<div class="grid h-full place-items-center"><div class="max-w-sm text-center"><div class="text-5xl opacity-30">◇</div><h2 class="mt-4 text-lg font-medium">{currentPhoto.displayBaseName}</h2><p class="mt-2 text-sm text-muted">{currentPhoto.isMissing ? '源文件已丢失' : currentPhoto.pairStatus === 'conflict' ? '配对存在冲突，请处理后重新扫描' : '缺少 JPEG，ARW 第一版不提供预览'}</p>{#if currentPhoto.isMissing}<Button class="mt-5" variant="danger" size="sm" on:click={deleteCurrentMissing}>删除数据库记录</Button>{/if}</div></div>
         {:else}<div class="grid h-full place-items-center text-sm text-muted">扫描照片目录后，从左侧选择照片</div>{/if}
-        {#if previewData}<button class="absolute bottom-4 right-4 rounded-md border border-border bg-black/60 px-3 py-1.5 text-xs text-muted backdrop-blur" on:click={() => zoom = 1}>{Math.round(zoom * 100)}% · 重置</button>{/if}
+        {#if previewData}<div class="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-lg border border-border bg-black/70 p-1 text-xs shadow-xl backdrop-blur"><button class="grid h-8 w-8 place-items-center rounded hover:bg-white/10" on:click={() => zoomBy(1 / 1.2)} aria-label="缩小">−</button><button class="min-w-[76px] rounded px-2 py-2 text-muted hover:bg-white/10 hover:text-foreground" on:click={resetPreview} title="双击图片或按 0 也可复位">{Math.round(zoom * 100)}% · 适合</button><button class="grid h-8 w-8 place-items-center rounded hover:bg-white/10" on:click={() => zoomBy(1.2)} aria-label="放大">＋</button><span class="hidden border-l border-border px-2 text-[10px] text-muted xl:inline">滚轮缩放 · 放大后拖拽</span></div>{/if}
       </section>
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('right', event)} aria-label="调整标签面板宽度"></button>
       <aside class="flex min-h-0 flex-col border-l border-border bg-panel">
@@ -371,6 +441,8 @@
 {#if deleteDialog}<Modal title="删除标签" description={`将删除“${deleteDialog.tag.name}”及其 ${deleteDialog.impact.tagCount - 1} 个子标签。`} on:close={() => deleteDialog = null}>{#if deleteDialog.impact.affectedPhotos > 0}<p class="rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm">标签子树正在被 <strong>{deleteDialog.impact.affectedPhotos}</strong> 张照片使用。请选择取消，或先将这些照片设为未标记再删除。</p>{:else}<p class="text-sm text-muted">该标签子树没有照片引用，可以安全删除。</p>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => deleteDialog = null}>不删除</Button><Button variant="danger" on:click={confirmDelete}>{deleteDialog.impact.affectedPhotos > 0 ? '取消标记并删除' : '确认删除'}</Button></div></Modal>{/if}
 
 {#if exportDialog}<Modal title="确认批量导出" description={`将导出到 ${exportDialog.root}`} on:close={() => exportDialog = null}><div class="grid grid-cols-2 gap-2 text-sm"><div class="rounded bg-white/5 p-3">可导出 <strong class="float-right text-accent">{exportDialog.plan.eligible}</strong></div><div class="rounded bg-white/5 p-3">同名冲突 <strong class="float-right text-amber-300">{exportDialog.plan.conflicts}</strong></div><div class="rounded bg-white/5 p-3">未标记 <strong class="float-right">{exportDialog.plan.skippedUntagged}</strong></div><div class="rounded bg-white/5 p-3">缺失/不完整 <strong class="float-right">{exportDialog.plan.skippedMissing + exportDialog.plan.skippedIncomplete}</strong></div></div>{#if exportDialog.plan.conflicts > 0}<label class="mt-4 block text-xs text-muted" for="strategy">本次所有同名冲突</label><select id="strategy" bind:value={exportDialog.strategy} class="mt-1 h-10 w-full rounded border border-border bg-[#101215] px-3 text-sm"><option value="skip">全部跳过</option><option value="overwrite">全部覆盖</option><option value="rename">全部自动改名</option></select>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => exportDialog = null}>取消</Button><Button variant="primary" on:click={confirmExport}>开始导出</Button></div></Modal>{/if}
+
+{#if existingProjectDialog}<Modal title="项目文件已存在" description={existingProjectDialog.databasePath} on:close={() => existingProjectDialog = null}><div class="space-y-3 text-sm"><div class="rounded-lg border border-border bg-white/5 p-3"><strong class="block">打开并升级</strong><p class="mt-1 text-xs leading-5 text-muted">保留已有标签、扫描记录和项目设置，并自动升级数据库结构。</p></div><div class="rounded-lg border border-danger/30 bg-danger/10 p-3"><strong class="block text-danger">强制覆盖</strong><p class="mt-1 text-xs leading-5 text-muted">删除原项目数据库及其中的标签和索引，再创建空项目；照片目录中的原文件不会被删除。</p></div></div><div class="mt-5 flex flex-wrap justify-end gap-2"><Button variant="ghost" on:click={() => existingProjectDialog = null}>取消</Button><Button on:click={() => resolveExistingProject('upgrade')}>打开并升级</Button><Button variant="danger" on:click={() => resolveExistingProject('overwrite')}>强制覆盖</Button></div></Modal>{/if}
 
 <ToastViewport />
 
