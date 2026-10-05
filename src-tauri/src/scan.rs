@@ -8,6 +8,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{codecs::jpeg::JpegEncoder, ImageReader};
+use rayon::prelude::*;
 use rusqlite::{params, OptionalExtension, Transaction};
 use walkdir::WalkDir;
 
@@ -240,6 +241,31 @@ fn thumbnail(path: &Path) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
+fn generate_thumbnails(groups: &[ScannedGroup]) -> Vec<Result<Option<Vec<u8>>, String>> {
+    let work = || {
+        groups
+            .par_iter()
+            .map(|group| {
+                if classify_group(&group.files) == "conflict" {
+                    return Ok(None);
+                }
+                let Some(jpeg) = group.files.iter().find(|file| file.kind == FileKind::Jpeg) else {
+                    return Ok(None);
+                };
+                thumbnail(&jpeg.absolute_path).map(Some).map_err(|error| {
+                    format!("缩略图生成失败 {}：{error}", jpeg.absolute_path.display())
+                })
+            })
+            .collect()
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|index| format!("thumbnail-{index}"))
+        .build()
+        .expect("failed to create thumbnail thread pool")
+        .install(work)
+}
+
 pub fn photo_preview(database_path: &Path, photo_id: i64) -> AppResult<String> {
     let connection = db::connect(database_path)?;
     let (root, relative): (String, String) = connection.query_row(
@@ -344,6 +370,7 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
         return Err(AppError::InvalidPhotoRoot(root));
     }
     let (groups, mut warnings, discovered_files) = collect_groups(&root)?;
+    let thumbnails = generate_thumbnails(&groups);
     let scan_complete = warnings.is_empty();
     let mut connection = db::connect(database_path)?;
     connection.execute("INSERT INTO scan_runs(status) VALUES('running')", [])?;
@@ -361,7 +388,7 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
     };
     let mut touched_entries = BTreeSet::new();
 
-    for group in groups {
+    for (group, thumbnail_result) in groups.into_iter().zip(thumbnails) {
         let status = classify_group(&group.files);
         match status {
             "complete" => summary.complete += 1,
@@ -436,19 +463,14 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
             }
         }
 
-        if status != "conflict" {
-            if let Some(jpeg) = group.files.iter().find(|file| file.kind == FileKind::Jpeg) {
-                match thumbnail(&jpeg.absolute_path) {
-                    Ok(bytes) => {
-                        transaction.execute(
-                        "UPDATE photo_entries SET thumbnail_blob=?1,thumbnail_mime='image/jpeg' WHERE id=?2", params![bytes,entry_id])?;
-                    }
-                    Err(error) => warnings.push(format!(
-                        "缩略图生成失败 {}：{error}",
-                        jpeg.absolute_path.display()
-                    )),
-                }
+        match thumbnail_result {
+            Ok(Some(bytes)) => {
+                transaction.execute(
+                    "UPDATE photo_entries SET thumbnail_blob=?1,thumbnail_mime='image/jpeg' WHERE id=?2",
+                    params![bytes,entry_id])?;
             }
+            Ok(None) => {}
+            Err(error) => warnings.push(error),
         }
     }
 
@@ -570,5 +592,59 @@ mod tests {
         assert_eq!(state.1, Some(tag_id));
         assert_eq!(PathBuf::from(state.2), PathBuf::from("day-two"));
         assert_eq!(state.3, 0);
+    }
+
+    #[test]
+    #[ignore = "requires NINI_REAL_PHOTO_ROOT and a large local photo collection"]
+    fn smoke_tests_a_real_photo_collection_without_modifying_sources() {
+        let root = PathBuf::from(
+            std::env::var("NINI_REAL_PHOTO_ROOT")
+                .expect("set NINI_REAL_PHOTO_ROOT to an existing photo directory"),
+        );
+        assert!(root.is_dir());
+        let workspace = tempfile::tempdir().unwrap();
+        let database = workspace.path().join("real-smoke.sqlite");
+        db::create_project(&database, &root).unwrap();
+
+        let started = std::time::Instant::now();
+        let summary = scan_project(&database).unwrap();
+        let connection = db::connect(&database).unwrap();
+        let database_counts: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM photo_entries),(SELECT COUNT(*) FROM photo_files)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(database_counts.0 as usize, summary.total_groups);
+        assert_eq!(database_counts.1 as usize, summary.discovered_files);
+        assert!(summary.total_groups > 0);
+
+        let photo_id: i64 = connection
+            .query_row(
+                "SELECT id FROM photo_entries WHERE pair_status='complete' AND is_missing=0 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the real collection should contain at least one complete pair");
+        let tag_id = db::create_tag(&connection, None, "真实目录冒烟测试").unwrap();
+        db::assign_tag(&connection, photo_id, Some(tag_id)).unwrap();
+        drop(connection);
+
+        let export_root = workspace.path().join("export");
+        let exported = crate::export::export_photos(&database, &export_root, "skip").unwrap();
+        assert_eq!(exported.succeeded, 1);
+        assert_eq!(exported.failed, 0);
+        println!(
+            "real scan: files={}, groups={}, complete={}, missing_jpeg={}, missing_raw={}, conflicts={}, warnings={}, elapsed={:?}",
+            summary.discovered_files,
+            summary.total_groups,
+            summary.complete,
+            summary.missing_jpeg,
+            summary.missing_raw,
+            summary.conflicts,
+            summary.warnings.len(),
+            started.elapsed()
+        );
     }
 }
