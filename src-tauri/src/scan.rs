@@ -43,6 +43,7 @@ struct ScannedFile {
     size: u64,
     modified_time: f64,
     quick_fingerprint: String,
+    content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -188,6 +189,7 @@ fn collect_groups(root: &Path) -> AppResult<(Vec<ScannedGroup>, Vec<String>, usi
             size: metadata.len(),
             modified_time: modified_time(&metadata),
             quick_fingerprint: fingerprint,
+            content_hash: None,
         };
         groups
             .entry(key.clone())
@@ -200,7 +202,34 @@ fn collect_groups(root: &Path) -> AppResult<(Vec<ScannedGroup>, Vec<String>, usi
             .push(file);
         discovered += 1;
     }
-    Ok((groups.into_values().collect(), warnings, discovered))
+    let mut groups: Vec<_> = groups.into_values().collect();
+    let mut fingerprint_counts = BTreeMap::new();
+    for file in groups.iter().flat_map(|group| &group.files) {
+        *fingerprint_counts
+            .entry((
+                file.kind.as_str(),
+                file.size,
+                file.quick_fingerprint.clone(),
+            ))
+            .or_insert(0_usize) += 1;
+    }
+    for file in groups.iter_mut().flat_map(|group| &mut group.files) {
+        let key = (
+            file.kind.as_str(),
+            file.size,
+            file.quick_fingerprint.clone(),
+        );
+        if fingerprint_counts.get(&key).copied().unwrap_or(0) > 1 {
+            match content_hash(&file.absolute_path) {
+                Ok(hash) => file.content_hash = Some(hash),
+                Err(error) => warnings.push(format!(
+                    "完整指纹生成失败 {}：{error}",
+                    file.absolute_path.display()
+                )),
+            }
+        }
+    }
+    Ok((groups, warnings, discovered))
 }
 
 fn thumbnail(path: &Path) -> AppResult<Vec<u8>> {
@@ -377,31 +406,33 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
             if let Some(file_id) = existing {
                 transaction.execute(
                     "UPDATE photo_files SET photo_entry_id=?1,original_file_name=?2,file_kind=?3,file_size=?4,
-                     modified_time=?5,quick_fingerprint=?6,is_missing=0,last_seen_scan_id=?7,updated_at=CURRENT_TIMESTAMP WHERE id=?8",
+                     modified_time=?5,quick_fingerprint=?6,content_hash=COALESCE(?7,content_hash),is_missing=0,
+                     last_seen_scan_id=?8,updated_at=CURRENT_TIMESTAMP WHERE id=?9",
                     params![entry_id,file.original_file_name,file.kind.as_str(),file.size as i64,file.modified_time,
-                        file.quick_fingerprint,scan_id,file_id])?;
+                        file.quick_fingerprint,file.content_hash,scan_id,file_id])?;
             } else if scan_complete {
                 if let Some((file_id, old_entry_id)) = movement_candidate(&transaction, file)? {
                     transaction.execute(
                         "UPDATE photo_files SET photo_entry_id=?1,original_file_name=?2,relative_path=?3,file_size=?4,
-                         modified_time=?5,quick_fingerprint=?6,is_missing=0,last_seen_scan_id=?7,updated_at=CURRENT_TIMESTAMP WHERE id=?8",
+                         modified_time=?5,quick_fingerprint=?6,content_hash=COALESCE(?7,content_hash),is_missing=0,
+                         last_seen_scan_id=?8,updated_at=CURRENT_TIMESTAMP WHERE id=?9",
                         params![entry_id,file.original_file_name,file.relative_path,file.size as i64,file.modified_time,
-                            file.quick_fingerprint,scan_id,file_id])?;
+                            file.quick_fingerprint,file.content_hash,scan_id,file_id])?;
                     touched_entries.insert(old_entry_id);
                     summary.moved_files += 1;
                 } else {
                     transaction.execute(
                         "INSERT INTO photo_files(photo_entry_id,file_kind,original_file_name,relative_path,file_size,modified_time,
-                         quick_fingerprint,is_missing,last_seen_scan_id) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8)",
+                         quick_fingerprint,content_hash,is_missing,last_seen_scan_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
                         params![entry_id,file.kind.as_str(),file.original_file_name,file.relative_path,file.size as i64,
-                            file.modified_time,file.quick_fingerprint,scan_id])?;
+                            file.modified_time,file.quick_fingerprint,file.content_hash,scan_id])?;
                 }
             } else {
                 transaction.execute(
                     "INSERT INTO photo_files(photo_entry_id,file_kind,original_file_name,relative_path,file_size,modified_time,
-                     quick_fingerprint,is_missing,last_seen_scan_id) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8)",
+                     quick_fingerprint,content_hash,is_missing,last_seen_scan_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
                     params![entry_id,file.kind.as_str(),file.original_file_name,file.relative_path,file.size as i64,
-                        file.modified_time,file.quick_fingerprint,scan_id])?;
+                        file.modified_time,file.quick_fingerprint,file.content_hash,scan_id])?;
             }
         }
 
@@ -452,6 +483,7 @@ mod tests {
             size: 0,
             modified_time: 0.0,
             quick_fingerprint: String::new(),
+            content_hash: None,
         }
     }
 
