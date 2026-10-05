@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { open, save } from '@tauri-apps/plugin-dialog';
   import Button from './lib/components/ui/Button.svelte';
   import Modal from './lib/components/ui/Modal.svelte';
@@ -47,6 +48,7 @@
     sortDirection = result.project.sortDirection;
     const next = preserveId ? result.photos.findIndex((photo) => photo.id === preserveId) : 0;
     selectedIndex = next >= 0 ? next : Math.min(selectedIndex, Math.max(0, result.photos.length - 1));
+    await tick();
     await loadPreview(currentPhoto);
   }
 
@@ -100,7 +102,7 @@
 
   async function choosePhoto(index: number) {
     if (index < 0 || index >= photos.length) return;
-    selectedIndex = index; await loadPreview(currentPhoto);
+    selectedIndex = index; await tick(); await loadPreview(currentPhoto);
   }
 
   async function assignSelectedTag(tagId: number, advance = false) {
