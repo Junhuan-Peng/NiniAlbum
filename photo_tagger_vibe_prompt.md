@@ -101,7 +101,7 @@ CREATE TABLE project_settings (
     )),
   sort_direction TEXT NOT NULL DEFAULT 'asc'
     CHECK (sort_direction IN ('asc', 'desc')),
-  schema_version INTEGER NOT NULL DEFAULT 2,
+  schema_version INTEGER NOT NULL DEFAULT 3,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -185,6 +185,8 @@ CREATE TABLE photo_entries (
   date_group TEXT NULL,
   location_group TEXT NULL,
   similarity_group TEXT NULL,
+  is_similarity_hidden INTEGER NOT NULL DEFAULT 0
+    CHECK (is_similarity_hidden IN (0, 1)),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(relative_dir, pairing_key)
@@ -204,6 +206,8 @@ CREATE INDEX idx_photo_sort_path ON photo_entries(relative_dir);
 - EXIF 字段来自 JPEG，只读入库，不回写 JPEG 或 ARW；旧项目在打开时自动迁移；
 - `date_group` 按拍摄日期生成，`location_group` 将 GPS 坐标按约 1 公里网格归类；
 - `perceptual_hash` 用于在拍摄时间相差 10 分钟内识别高度相似照片，命中后写入稳定的 `similarity_group`；
+- 相似组是照片浏览的固有上下文，不属于智能筛选项；选择组内照片时在预览区右侧显示完整组；
+- 用户可将组内照片从主列表隐藏，状态写入 `is_similarity_hidden`。隐藏照片仍可在相似组侧栏查看和恢复，并且每组至少保留一个未隐藏成员作为入口；
 - 配对状态与丢失状态相互独立，例如历史上完整配对的照片组移动失败后可以是 `complete + is_missing=1`。
 
 ### 4.5 `photo_files`：照片组内的实际文件

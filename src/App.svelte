@@ -33,15 +33,25 @@
   let exportDialog: { root: string; plan: ExportPlan; strategy: 'skip' | 'overwrite' | 'rename' } | null = null;
   let existingProjectDialog: { databasePath: string; photoRoot: string } | null = null;
   let recentProjects: { path: string; name: string; photoRoot: string; lastOpened: number }[] = [];
-  let smartKind: 'none' | 'date' | 'location' | 'similarity' = 'none';
+  let smartKind: 'none' | 'date' | 'location' = 'none';
   let smartGroup = '';
+  let selectedPhotoId: number | null = null;
+  let similarPhotos: PhotoEntry[] = [];
+  let similarLoading = false;
+  let similarityRequest = 0;
 
   $: sourcePhotos = snapshot?.photos ?? [];
   $: smartOptions = Array.from(new Set(sourcePhotos.map((photo) => smartValue(photo, smartKind)).filter((value): value is string => Boolean(value)))).sort();
-  $: photos = smartKind === 'none'
+  $: classifiedPhotos = smartKind === 'none'
     ? sourcePhotos
     : sourcePhotos.filter((photo) => smartGroup ? smartValue(photo, smartKind) === smartGroup : Boolean(smartValue(photo, smartKind)));
-  $: currentPhoto = photos[selectedIndex] ?? null;
+  $: photos = classifiedPhotos.filter((photo) => !photo.isSimilarityHidden);
+  $: currentPhoto = similarPhotos.find((photo) => photo.id === selectedPhotoId)
+    ?? sourcePhotos.find((photo) => photo.id === selectedPhotoId)
+    ?? photos[selectedIndex]
+    ?? null;
+  $: currentListIndex = currentPhoto ? photos.findIndex((photo) => photo.id === currentPhoto.id) : -1;
+  $: hiddenSimilarityCount = sourcePhotos.filter((photo) => photo.isSimilarityHidden).length;
   $: roots = (snapshot?.tags ?? []).filter((tag) => tag.parentId === null);
   $: selectedTag = snapshot?.tags.find((tag) => tag.id === selectedTagId) ?? null;
   $: scanPercent = scanProgress && scanProgress.total > 0
@@ -53,7 +63,6 @@
   function smartValue(photo: PhotoEntry, kind: typeof smartKind) {
     if (kind === 'date') return photo.dateGroup;
     if (kind === 'location') return photo.locationGroup;
-    if (kind === 'similarity') return photo.similarityGroup;
     return null;
   }
 
@@ -82,12 +91,16 @@
     smartGroup = '';
     selectedIndex = 0;
     await tick();
+    selectedPhotoId = photos[0]?.id ?? null;
+    await loadSimilarityPhotos(selectedPhotoId);
     await loadPreview(currentPhoto);
   }
 
   async function changeSmartGroup() {
     selectedIndex = 0;
     await tick();
+    selectedPhotoId = photos[0]?.id ?? null;
+    await loadSimilarityPhotos(selectedPhotoId);
     await loadPreview(currentPhoto);
   }
 
@@ -98,15 +111,18 @@
     finally { busy = false; busyLabel = ''; }
   }
 
-  async function refresh(preserveId = currentPhoto?.id) {
+  async function refresh(preserveId: number | null = currentPhoto?.id ?? null) {
     const result = await api.snapshot({ filter, sortField, sortDirection });
     snapshot = result;
     sortField = result.project.sortField;
     sortDirection = result.project.sortDirection;
     await tick();
-    const next = preserveId ? photos.findIndex((photo) => photo.id === preserveId) : 0;
-    selectedIndex = next >= 0 ? next : Math.min(selectedIndex, Math.max(0, result.photos.length - 1));
+    const preservable = preserveId && sourcePhotos.some((photo) => photo.id === preserveId) ? preserveId : null;
+    const next = preservable ? photos.findIndex((photo) => photo.id === preservable) : 0;
+    selectedIndex = next >= 0 ? next : Math.min(selectedIndex, Math.max(0, photos.length - 1));
+    selectedPhotoId = preservable ?? photos[selectedIndex]?.id ?? null;
     await tick();
+    await loadSimilarityPhotos(selectedPhotoId);
     await loadPreview(currentPhoto);
   }
 
@@ -119,7 +135,7 @@
     busy = true; busyLabel = '正在创建项目…';
     try {
       await api.createProject(databasePath, photoRoot);
-      filter = 'all'; selectedIndex = 0; await refresh();
+      filter = 'all'; selectedIndex = 0; await refresh(null);
       rememberProject(databasePath, photoRoot);
       toast('项目已创建，可以开始扫描照片。', 'success');
     } catch (error) {
@@ -138,7 +154,7 @@
         ? await api.openProject(databasePath)
         : await api.replaceProject(databasePath, photoRoot);
       filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
-      await refresh();
+      await refresh(null);
       rememberProject(databasePath, info.photoRoot);
       toast(action === 'upgrade' ? '旧项目已升级并打开，原有标签和索引已保留。' : '旧项目已覆盖，照片原文件未被修改。', 'success', 6000);
     });
@@ -150,7 +166,7 @@
     await runBusy('正在打开项目…', async () => {
       const info = await api.openProject(path);
       filter = 'all'; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
-      await refresh();
+      await refresh(null);
       rememberProject(path, info.photoRoot);
       toast(info.photoRootAvailable ? '项目已打开。' : '项目已打开，但原照片目录不可用，请重新定位。', info.photoRootAvailable ? 'success' : 'error', 6000);
     });
@@ -160,7 +176,7 @@
     await runBusy('正在打开项目…', async () => {
       const info = await api.openProject(path);
       filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
-      await refresh();
+      await refresh(null);
       rememberProject(path, info.photoRoot);
       toast(info.photoRootAvailable ? '项目已打开。' : '原照片目录不可用，请重新定位。', info.photoRootAvailable ? 'success' : 'error');
     });
@@ -197,7 +213,49 @@
 
   async function choosePhoto(index: number) {
     if (index < 0 || index >= photos.length) return;
-    selectedIndex = index; await tick(); await loadPreview(currentPhoto);
+    selectedIndex = index; selectedPhotoId = photos[index].id;
+    await tick(); await loadSimilarityPhotos(selectedPhotoId); await loadPreview(currentPhoto);
+  }
+
+  async function loadSimilarityPhotos(photoId: number | null) {
+    const request = ++similarityRequest;
+    if (photoId === null) { similarPhotos = []; return; }
+    similarLoading = true;
+    try {
+      const result = await api.similarityPhotos(photoId);
+      if (request === similarityRequest) similarPhotos = result;
+    } catch (error) {
+      if (request === similarityRequest) similarPhotos = [];
+      toast(`相似照片加载失败：${errorMessage(error)}`, 'error');
+    } finally {
+      if (request === similarityRequest) similarLoading = false;
+    }
+  }
+
+  async function chooseSimilarPhoto(photo: PhotoEntry) {
+    selectedPhotoId = photo.id;
+    const listIndex = photos.findIndex((item) => item.id === photo.id);
+    if (listIndex >= 0) selectedIndex = listIndex;
+    await tick();
+    await loadPreview(currentPhoto);
+  }
+
+  async function toggleSimilarityHidden(photo: PhotoEntry) {
+    const hidden = !photo.isSimilarityHidden;
+    if (hidden && similarPhotos.filter((item) => !item.isSimilarityHidden).length <= 1) {
+      toast('每个相似组至少保留一张照片在主列表中，方便之后重新打开该组。');
+      return;
+    }
+    try {
+      await api.setSimilarityHidden(photo.id, hidden);
+      const update = (item: PhotoEntry) => item.id === photo.id ? { ...item, isSimilarityHidden: hidden } : item;
+      similarPhotos = similarPhotos.map(update);
+      if (snapshot) snapshot = { ...snapshot, photos: snapshot.photos.map(update) };
+      await tick();
+      const listIndex = photos.findIndex((item) => item.id === selectedPhotoId);
+      if (listIndex >= 0) selectedIndex = listIndex;
+      toast(hidden ? `已从主列表隐藏 ${photo.displayBaseName}` : `已恢复 ${photo.displayBaseName} 到主列表`, 'success');
+    } catch (error) { toast(errorMessage(error), 'error'); }
   }
 
   async function assignSelectedTag(tagId: number, advance = false) {
@@ -386,11 +444,11 @@
         <div class="space-y-2 border-b border-border p-2">
           <select bind:value={filter} on:change={updateQuery} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="all">全部照片</option><option value="tagged">已标记</option><option value="untagged">未标记</option><option value="complete">配对完整</option><option value="incomplete">配对缺失</option><option value="conflict">配对冲突</option><option value="missing">文件丢失</option></select>
           <div class="flex gap-1"><select bind:value={sortField} on:change={updateQuery} class="h-8 min-w-0 flex-1 rounded border border-border bg-[#111316] px-2 text-xs"><option value="file_name">文件名</option><option value="relative_path">相对路径</option><option value="modified_time">修改时间</option><option value="tagged_status">标注状态</option><option value="missing_status">缺失状态</option></select><button class="h-8 w-9 rounded border border-border bg-[#111316] text-xs" on:click={() => { sortDirection = sortDirection === 'asc' ? 'desc' : 'asc'; updateQuery(); }} aria-label="切换排序方向">{sortDirection === 'asc' ? '↑' : '↓'}</button></div>
-          <div class="rounded-lg border border-border bg-black/10 p-1.5"><label class="mb-1 block px-0.5 text-[9px] font-semibold uppercase tracking-widest text-muted" for="smart-kind">智能分类</label><select id="smart-kind" bind:value={smartKind} on:change={changeSmartKind} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="none">不筛选</option><option value="date">拍摄日期</option><option value="location">地理坐标</option><option value="similarity">相似照片组</option></select>{#if smartKind !== 'none'}<select bind:value={smartGroup} on:change={changeSmartGroup} class="mt-1 h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="">全部有数据的照片</option>{#each smartOptions as option}<option value={option}>{option}</option>{/each}</select>{#if smartOptions.length === 0}<p class="px-1 pt-1.5 text-[10px] text-muted">暂无数据，请重新扫描照片。</p>{/if}{/if}</div>
+          <div class="rounded-lg border border-border bg-black/10 p-1.5"><label class="mb-1 block px-0.5 text-[9px] font-semibold uppercase tracking-widest text-muted" for="smart-kind">智能分类</label><select id="smart-kind" bind:value={smartKind} on:change={changeSmartKind} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="none">不筛选</option><option value="date">拍摄日期</option><option value="location">地理坐标</option></select>{#if smartKind !== 'none'}<select bind:value={smartGroup} on:change={changeSmartGroup} class="mt-1 h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="">全部有数据的照片</option>{#each smartOptions as option}<option value={option}>{option}</option>{/each}</select>{#if smartOptions.length === 0}<p class="px-1 pt-1.5 text-[10px] text-muted">暂无数据，请重新扫描照片。</p>{/if}{/if}</div>
         </div>
         <div class="min-h-0 flex-1 overflow-y-auto p-1.5">
           {#each photos as photo, index (photo.id)}
-            <button class:active={index === selectedIndex} class="mb-1 flex min-h-[88px] w-full items-center gap-3 rounded-lg border border-transparent p-2 text-left hover:bg-white/5" on:click={() => choosePhoto(index)}>
+            <button class:active={photo.id === currentPhoto?.id} class="mb-1 flex min-h-[88px] w-full items-center gap-3 rounded-lg border border-transparent p-2 text-left hover:bg-white/5" on:click={() => choosePhoto(index)}>
               <div class="grid shrink-0 place-items-center overflow-hidden rounded-md bg-[#0d0e10] text-[10px] text-muted shadow-sm" style={thumbnailStyle(photo)}>{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt="" class="h-full w-full object-cover" />{:else}{photo.isMissing ? '丢失' : photo.pairStatus === 'conflict' ? '冲突' : 'RAW'}{/if}</div>
               <div class="min-w-0 flex-1 py-0.5"><div class="truncate text-xs font-medium">{photo.displayBaseName}</div><div class="mt-1 truncate text-[10px] text-muted">{photo.relativeDir || '根目录'}</div><div class="mt-1 flex items-center gap-1 text-[9px]">{#if photo.isMissing}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">丢失</span>{:else if photo.pairStatus === 'conflict'}<span class="rounded bg-amber-400/15 px-1.5 py-0.5 text-amber-300">冲突</span>{:else if photo.pairStatus !== 'complete'}<span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-sky-300">缺配对</span>{/if}{#if photo.tagId}<span class="truncate rounded bg-accent/10 px-1.5 py-0.5 text-accent">{photo.tagPath}</span>{/if}</div></div>
             </button>
@@ -398,12 +456,28 @@
         </div>
       </aside>
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('left', event)} aria-label="调整缩略图面板宽度"></button>
-      <section class="relative min-w-0 overflow-hidden bg-[#0b0c0e]" on:wheel={zoomPreview}>
-        {#if previewData}<div role="application" aria-label="图片预览：滚轮或按钮缩放，放大后拖拽，双击复位" class:cursor-grabbing={panning} class:cursor-grab={!panning} class="grid h-full w-full touch-none place-items-center overflow-hidden p-8" on:pointerdown={startPan} on:dblclick={resetPreview}><img src={previewData} alt={currentPhoto?.displayBaseName} class="max-h-full max-w-full select-none object-contain shadow-2xl" draggable="false" style={`transform:translate(${panX}px,${panY}px) scale(${zoom});transform-origin:center`} /></div>
-        {:else if previewLoading}<div class="grid h-full place-items-center text-sm text-muted">正在加载 JPEG 预览…</div>
-        {:else if currentPhoto}<div class="grid h-full place-items-center"><div class="max-w-sm text-center"><div class="text-5xl opacity-30">◇</div><h2 class="mt-4 text-lg font-medium">{currentPhoto.displayBaseName}</h2><p class="mt-2 text-sm text-muted">{currentPhoto.isMissing ? '源文件已丢失' : currentPhoto.pairStatus === 'conflict' ? '配对存在冲突，请处理后重新扫描' : '缺少 JPEG，ARW 第一版不提供预览'}</p>{#if currentPhoto.isMissing}<Button class="mt-5" variant="danger" size="sm" on:click={deleteCurrentMissing}>删除数据库记录</Button>{/if}</div></div>
-        {:else}<div class="grid h-full place-items-center text-sm text-muted">扫描照片目录后，从左侧选择照片</div>{/if}
-        {#if previewData}<div class="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-lg border border-border bg-black/70 p-1 text-xs shadow-xl backdrop-blur"><button class="grid h-8 w-8 place-items-center rounded hover:bg-white/10" on:click={() => zoomBy(1 / 1.2)} aria-label="缩小">−</button><button class="min-w-[76px] rounded px-2 py-2 text-muted hover:bg-white/10 hover:text-foreground" on:click={resetPreview} title="双击图片或按 0 也可复位">{Math.round(zoom * 100)}% · 适合</button><button class="grid h-8 w-8 place-items-center rounded hover:bg-white/10" on:click={() => zoomBy(1.2)} aria-label="放大">＋</button><span class="hidden border-l border-border px-2 text-[10px] text-muted xl:inline">滚轮缩放 · 放大后拖拽</span></div>{/if}
+      <section class="flex min-w-0 overflow-hidden bg-[#0b0c0e]">
+        <div class="relative min-w-0 flex-1 overflow-hidden" on:wheel={zoomPreview}>
+          {#if previewData}<div role="application" aria-label="图片预览：滚轮或按钮缩放，放大后拖拽，双击复位" class:cursor-grabbing={panning} class:cursor-grab={!panning} class="grid h-full w-full touch-none place-items-center overflow-hidden p-8" on:pointerdown={startPan} on:dblclick={resetPreview}><img src={previewData} alt={currentPhoto?.displayBaseName} class="max-h-full max-w-full select-none object-contain shadow-2xl" draggable="false" style={`transform:translate(${panX}px,${panY}px) scale(${zoom});transform-origin:center`} /></div>
+          {:else if previewLoading}<div class="grid h-full place-items-center text-sm text-muted">正在加载 JPEG 预览…</div>
+          {:else if currentPhoto}<div class="grid h-full place-items-center"><div class="max-w-sm text-center"><div class="text-5xl opacity-30">◇</div><h2 class="mt-4 text-lg font-medium">{currentPhoto.displayBaseName}</h2><p class="mt-2 text-sm text-muted">{currentPhoto.isMissing ? '源文件已丢失' : currentPhoto.pairStatus === 'conflict' ? '配对存在冲突，请处理后重新扫描' : '缺少 JPEG，ARW 第一版不提供预览'}</p>{#if currentPhoto.isMissing}<Button class="mt-5" variant="danger" size="sm" on:click={deleteCurrentMissing}>删除数据库记录</Button>{/if}</div></div>
+          {:else}<div class="grid h-full place-items-center text-sm text-muted">扫描照片目录后，从左侧选择照片</div>{/if}
+          {#if previewData}<div class="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-lg border border-border bg-black/70 p-1 text-xs shadow-xl backdrop-blur"><button class="grid h-8 w-8 place-items-center rounded hover:bg-white/10" on:click={() => zoomBy(1 / 1.2)} aria-label="缩小">−</button><button class="min-w-[76px] rounded px-2 py-2 text-muted hover:bg-white/10 hover:text-foreground" on:click={resetPreview} title="双击图片或按 0 也可复位">{Math.round(zoom * 100)}% · 适合</button><button class="grid h-8 w-8 place-items-center rounded hover:bg-white/10" on:click={() => zoomBy(1.2)} aria-label="放大">＋</button><span class="hidden border-l border-border px-2 text-[10px] text-muted xl:inline">滚轮缩放 · 放大后拖拽</span></div>{/if}
+        </div>
+        {#if similarLoading || similarPhotos.length > 1}
+          <aside class="flex w-44 shrink-0 flex-col border-l border-border bg-[#121417]">
+            <div class="border-b border-border px-3 py-2"><div class="text-[10px] font-semibold uppercase tracking-[.16em] text-muted">相似照片</div><div class="mt-0.5 text-xs">{similarPhotos.length} 张{#if similarPhotos.some((photo) => photo.isSimilarityHidden)} · {similarPhotos.filter((photo) => photo.isSimilarityHidden).length} 张已隐藏{/if}</div></div>
+            <div class="min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
+              {#if similarLoading}<div class="py-6 text-center text-[10px] text-muted">正在加载…</div>{/if}
+              {#each similarPhotos as photo (photo.id)}
+                <div class:opacity-50={photo.isSimilarityHidden} class:active={photo.id === currentPhoto?.id} class="group rounded-lg border border-transparent p-1.5 hover:bg-white/5">
+                  <button class="block w-full text-left" on:click={() => chooseSimilarPhoto(photo)} title={photo.displayBaseName}><div class="grid h-20 w-full place-items-center overflow-hidden rounded bg-black/40">{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt={photo.displayBaseName} class="h-full w-full object-contain" />{:else}<span class="text-[10px] text-muted">无缩略图</span>{/if}</div><div class="mt-1.5 truncate text-[10px]">{photo.displayBaseName}</div></button>
+                  <button class="mt-1 w-full rounded border border-border px-1.5 py-1 text-[9px] text-muted hover:border-accent/40 hover:text-foreground" on:click={() => toggleSimilarityHidden(photo)}>{photo.isSimilarityHidden ? '恢复到主列表' : '从主列表隐藏'}</button>
+                </div>
+              {/each}
+            </div>
+          </aside>
+        {/if}
       </section>
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('right', event)} aria-label="调整标签面板宽度"></button>
       <aside class="flex min-h-0 flex-col border-l border-border bg-panel">
@@ -421,7 +495,7 @@
               <span class="text-muted">ISO</span><span>{currentPhoto.iso ?? '—'}</span>
               <span class="text-muted">焦距</span><span>{currentPhoto.focalLength ?? '—'}</span>
               <span class="text-muted">坐标</span><span>{currentPhoto.latitude !== null && currentPhoto.longitude !== null ? `${currentPhoto.latitude.toFixed(5)}, ${currentPhoto.longitude.toFixed(5)}` : '—'}</span>
-              {#if currentPhoto.similarityGroup}<span class="text-muted">智能组</span><span class="text-accent">{currentPhoto.similarityGroup}</span>{/if}
+              {#if currentPhoto.similarityGroup}<span class="text-muted">相似组</span><span class="text-accent">{currentPhoto.similarityGroup}</span>{/if}
             </div>
           {:else}<p class="px-3 pb-3 text-[10px] text-muted">选择照片后显示 EXIF。</p>{/if}
         </details>
@@ -430,7 +504,7 @@
         <div class="border-t border-border p-3 text-[10px] leading-5 text-muted">单击立即分配 · 空格重复分配并前进<br />↑ ↓ 切换照片 · ⌘/Ctrl+S 同步</div>
       </aside>
     </section>
-    <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{photos.length ? selectedIndex + 1 : 0} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span><span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span><span class="ml-auto max-w-[35%] truncate">{snapshot.project.photoRoot}</span></footer>
+    <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{currentListIndex >= 0 ? currentListIndex + 1 : '组内'} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span>{#if hiddenSimilarityCount}<span>相似图隐藏 {hiddenSimilarityCount}</span>{/if}<span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span><span class="ml-auto max-w-[35%] truncate">{snapshot.project.photoRoot}</span></footer>
   {:else}
     <section class="min-h-0 flex-1 overflow-y-auto bg-[radial-gradient(circle_at_top,#20242a_0,#101113_58%)] p-8"><div class="mx-auto flex min-h-full max-w-3xl flex-col justify-center py-8"><div class="text-center"><div class="mx-auto grid h-20 w-20 place-items-center rounded-3xl border border-accent/30 bg-accent/10 text-4xl font-black text-accent">N</div><h1 class="mt-7 text-3xl font-semibold">整理照片，不改动原片</h1><p class="mt-3 leading-7 text-muted">递归配对 JPEG 与 Sony ARW，读取 EXIF 并智能归类，再按标签目录安全导出。</p><div class="mt-7 flex justify-center gap-3"><Button variant="primary" on:click={createProject}>新建项目</Button><Button on:click={openProject}>打开已有项目</Button></div></div>{#if recentProjects.length}<div class="mt-12"><div class="mb-3 flex items-center justify-between"><h2 class="text-sm font-semibold">最近打开</h2><span class="text-[10px] text-muted">最多保留 6 个项目</span></div><div class="grid gap-2 sm:grid-cols-2">{#each recentProjects as recent}<button class="group rounded-xl border border-border bg-panel/80 p-3 text-left transition hover:border-accent/40 hover:bg-white/5" on:click={() => openRecentProject(recent.path)}><div class="flex items-center gap-3"><div class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/10 text-sm font-bold text-accent">N</div><div class="min-w-0"><div class="truncate text-sm font-medium group-hover:text-accent">{recent.name}</div><div class="mt-0.5 truncate text-[10px] text-muted">{recent.photoRoot}</div></div></div></button>{/each}</div></div>{/if}</div></section>
   {/if}

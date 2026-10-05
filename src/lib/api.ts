@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
-  DeleteImpact, ExportPlan, ExportSummary, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary
+  DeleteImpact, ExportPlan, ExportSummary, PhotoEntry, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary
 } from './types';
 
 export const api = {
@@ -12,6 +12,8 @@ export const api = {
   snapshot: (query?: PhotoQuery) => invoke<ProjectSnapshot>('get_snapshot', { query }),
   scan: () => invoke<ScanSummary>('scan_project'),
   preview: (photoId: number) => invoke<string>('get_photo_preview', { photoId }),
+  similarityPhotos: (photoId: number) => invoke<PhotoEntry[]>('get_similarity_photos', { photoId }),
+  setSimilarityHidden: (photoId: number, hidden: boolean) => invoke<void>('set_similarity_hidden', { photoId, hidden }),
   createTag: (name: string, parentId: number | null) => invoke<number>('create_tag', { name, parentId }),
   renameTag: (id: number, name: string) => invoke<void>('rename_tag', { id, name }),
   deleteImpact: (id: number) => invoke<DeleteImpact>('inspect_tag_delete', { id }),

@@ -46,6 +46,7 @@ export interface PhotoEntry {
   dateGroup: string | null;
   locationGroup: string | null;
   similarityGroup: string | null;
+  isSimilarityHidden: boolean;
 }
 
 export interface ProjectCounts { total: number; tagged: number; missing: number; conflicts: number; incomplete: number; }
