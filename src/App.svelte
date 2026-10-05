@@ -20,6 +20,7 @@
   let busyLabel = '';
   let previewData: string | null = null;
   let previewLoading = false;
+  let previewRequest = 0;
   let scanProgress: ScanProgress | null = null;
   let zoom = 1;
   let panX = 0;
@@ -49,6 +50,13 @@
   let lastChangeCheck = 0;
   let maintenanceRunning = false;
   let sourceChanged = false;
+
+  const previewCache = new Map<number, string>();
+  const previewInFlight = new Map<number, Promise<string>>();
+  const previewCacheLimit = 16;
+  let previewCacheGeneration = 0;
+  let previewWarmRequest = 0;
+  let previewWarmQueue = Promise.resolve();
 
   $: sourcePhotos = snapshot?.photos ?? [];
   $: smartOptions = Array.from(new Set(sourcePhotos.map((photo) => smartValue(photo, smartKind)).filter((value): value is string => Boolean(value)))).sort();
@@ -118,21 +126,106 @@
     localStorage.setItem('nini-albums-recent-projects', JSON.stringify(recentProjects));
   }
 
+  function canPreview(photo: PhotoEntry | null | undefined): photo is PhotoEntry {
+    return Boolean(photo?.jpegRelativePath && !photo.isMissing && photo.pairStatus !== 'conflict');
+  }
+
+  function clearPreviewCache() {
+    previewCacheGeneration += 1;
+    previewWarmRequest += 1;
+    previewRequest += 1;
+    previewCache.clear();
+    previewInFlight.clear();
+    previewData = null;
+    previewLoading = false;
+    resetPreview();
+  }
+
+  function cachedPreview(photoId: number) {
+    const data = previewCache.get(photoId);
+    if (!data) return null;
+    previewCache.delete(photoId);
+    previewCache.set(photoId, data);
+    return data;
+  }
+
+  function rememberPreview(photoId: number, data: string) {
+    previewCache.delete(photoId);
+    previewCache.set(photoId, data);
+    while (previewCache.size > previewCacheLimit) {
+      const oldest = previewCache.keys().next().value;
+      if (oldest === undefined) break;
+      previewCache.delete(oldest);
+    }
+  }
+
+  async function decodePreview(data: string) {
+    const image = new Image();
+    image.src = data;
+    try { await image.decode(); }
+    catch { /* WebKit 仍可在后续 img 元素中解码，不阻断预览。 */ }
+  }
+
+  function fetchPreview(photo: PhotoEntry) {
+    const cached = cachedPreview(photo.id);
+    if (cached) return Promise.resolve(cached);
+    const existing = previewInFlight.get(photo.id);
+    if (existing) return existing;
+
+    const generation = previewCacheGeneration;
+    const request = api.preview(photo.id).then(async (data) => {
+      await decodePreview(data);
+      if (generation === previewCacheGeneration) rememberPreview(photo.id, data);
+      return data;
+    });
+    previewInFlight.set(photo.id, request);
+    void request.then(() => {
+      if (previewInFlight.get(photo.id) === request) previewInFlight.delete(photo.id);
+    }, () => {
+      if (previewInFlight.get(photo.id) === request) previewInFlight.delete(photo.id);
+    });
+    return request;
+  }
+
+  function prewarmNearbyPreviews(photoId: number) {
+    const candidates: PhotoEntry[] = [];
+    const seen = new Set<number>([photoId]);
+    const listIndex = photos.findIndex((photo) => photo.id === photoId);
+    if (listIndex >= 0) {
+      for (const offset of [-1, 1, -2, 2]) {
+        const photo = photos[listIndex + offset];
+        if (canPreview(photo) && !seen.has(photo.id)) { seen.add(photo.id); candidates.push(photo); }
+      }
+    }
+    if (similarPhotos.some((photo) => photo.id === photoId)) {
+      for (const photo of similarPhotos) {
+        if (canPreview(photo) && !seen.has(photo.id)) { seen.add(photo.id); candidates.push(photo); }
+        if (candidates.length >= 4) break;
+      }
+    }
+    const request = ++previewWarmRequest;
+    previewWarmQueue = previewWarmQueue.catch(() => {}).then(async () => {
+      for (const photo of candidates.slice(0, 4)) {
+        if (request !== previewWarmRequest) return;
+        try { await fetchPreview(photo); }
+        catch { /* 预热失败不打扰当前照片。 */ }
+      }
+    });
+  }
+
   async function changeSmartKind() {
     smartGroup = '';
     selectedIndex = 0;
     await tick();
     selectedPhotoId = photos[0]?.id ?? null;
-    await loadSimilarityPhotos(selectedPhotoId);
-    await loadPreview(currentPhoto);
+    await Promise.all([loadSimilarityPhotos(selectedPhotoId), loadPreview(currentPhoto)]);
   }
 
   async function changeSmartGroup() {
     selectedIndex = 0;
     await tick();
     selectedPhotoId = photos[0]?.id ?? null;
-    await loadSimilarityPhotos(selectedPhotoId);
-    await loadPreview(currentPhoto);
+    await Promise.all([loadSimilarityPhotos(selectedPhotoId), loadPreview(currentPhoto)]);
   }
 
   async function runBusy<T>(label: string, task: () => Promise<T>): Promise<T | undefined> {
@@ -153,8 +246,7 @@
     selectedIndex = next >= 0 ? next : Math.min(selectedIndex, Math.max(0, photos.length - 1));
     selectedPhotoId = preservable ?? photos[selectedIndex]?.id ?? null;
     await tick();
-    await loadSimilarityPhotos(selectedPhotoId);
-    await loadPreview(currentPhoto);
+    await Promise.all([loadSimilarityPhotos(selectedPhotoId), loadPreview(currentPhoto)]);
   }
 
   async function createProject() {
@@ -167,6 +259,7 @@
     busy = true; busyLabel = '正在创建项目…';
     try {
       await api.createProject(databasePath, photoRoot);
+      clearPreviewCache();
       filter = 'all'; selectedIndex = 0; await refresh(null);
       rememberProject(databasePath, photoRoot);
       toast('项目已创建，正在首次扫描照片。', 'success');
@@ -187,6 +280,7 @@
       const info = action === 'upgrade'
         ? await api.openProject(databasePath)
         : await api.replaceProject(databasePath, photoRoot);
+      clearPreviewCache();
       filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
       await refresh(null);
       sourceChanged = false; lastChangeCheck = 0;
@@ -202,6 +296,7 @@
     if (!path || Array.isArray(path)) return;
     await runBusy('正在打开项目…', async () => {
       const info = await api.openProject(path);
+      clearPreviewCache();
       filter = 'all'; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
       await refresh(null);
       sourceChanged = false; lastChangeCheck = 0;
@@ -213,6 +308,7 @@
   async function openRecentProject(path: string) {
     await runBusy('正在打开项目…', async () => {
       const info = await api.openProject(path);
+      clearPreviewCache();
       filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
       await refresh(null);
       sourceChanged = false; lastChangeCheck = 0;
@@ -225,7 +321,7 @@
     scanProgress = { phase: 'discovering', completed: 0, total: 0, message: '正在递归发现照片文件' };
     try {
       await runBusy('正在扫描…', async () => {
-        const result = await api.scan(); sourceChanged = false; await refresh();
+        const result = await api.scan(); clearPreviewCache(); sourceChanged = false; await refresh();
         toast(`扫描完成：${result.totalGroups} 组，完整 ${result.complete}，缺配对 ${result.missingJpeg + result.missingRaw}，冲突 ${result.conflicts}`, result.warnings.length ? 'default' : 'success', 6000);
       });
     } finally {
@@ -234,18 +330,35 @@
   }
 
   async function loadPreview(photo: PhotoEntry | null) {
-    previewData = null; resetPreview();
-    if (!photo?.jpegRelativePath || photo.isMissing || photo.pairStatus === 'conflict') return;
-    const requested = photo.id; previewLoading = true;
-    try { const data = await api.preview(requested); if (currentPhoto?.id === requested) previewData = data; }
+    const request = ++previewRequest;
+    resetPreview();
+    if (!canPreview(photo)) { previewData = null; previewLoading = false; return; }
+    const requested = photo.id;
+    const cached = cachedPreview(requested);
+    if (cached) {
+      previewData = cached;
+      previewLoading = false;
+      prewarmNearbyPreviews(requested);
+      return;
+    }
+    previewData = null;
+    previewLoading = true;
+    try {
+      const data = await fetchPreview(photo);
+      if (request === previewRequest && currentPhoto?.id === requested) {
+        previewData = data;
+        prewarmNearbyPreviews(requested);
+      }
+    }
     catch (error) { toast(`预览加载失败：${errorMessage(error)}`, 'error'); }
-    finally { previewLoading = false; }
+    finally { if (request === previewRequest) previewLoading = false; }
   }
 
   async function choosePhoto(index: number) {
     if (index < 0 || index >= photos.length) return;
     selectedIndex = index; selectedPhotoId = photos[index].id;
-    await tick(); await loadSimilarityPhotos(selectedPhotoId); await loadPreview(currentPhoto);
+    await tick();
+    await Promise.all([loadSimilarityPhotos(selectedPhotoId), loadPreview(currentPhoto)]);
   }
 
   async function loadSimilarityPhotos(photoId: number | null) {
@@ -512,7 +625,7 @@
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('left', event)} aria-label="调整缩略图面板宽度"></button>
       <section class="flex min-w-0 overflow-hidden bg-[#0b0c0e]">
         <div class="relative min-w-0 flex-1 overflow-hidden" on:wheel={zoomPreview}>
-          {#if previewData}<div role="application" aria-label="图片预览：滚轮或按钮缩放，放大后拖拽，双击复位" class:cursor-grabbing={panning} class:cursor-grab={!panning} class="grid h-full w-full touch-none place-items-center overflow-hidden p-8" on:pointerdown={startPan} on:dblclick={resetPreview}><img src={previewData} alt={currentPhoto?.displayBaseName} class="max-h-full max-w-full select-none object-contain shadow-2xl" draggable="false" style={`transform:translate(${panX}px,${panY}px) scale(${zoom});transform-origin:center`} /></div>
+          {#if previewData}<div role="application" aria-label="图片预览：滚轮或按钮缩放，放大后拖拽，双击复位" class:cursor-grabbing={panning} class:cursor-grab={!panning} class="absolute inset-0 flex touch-none items-center justify-center overflow-hidden p-8" on:pointerdown={startPan} on:dblclick={resetPreview}><img src={previewData} alt={currentPhoto?.displayBaseName} class="block max-h-full max-w-full select-none object-contain shadow-2xl" draggable="false" style={`transform:translate(${panX}px,${panY}px) scale(${zoom});transform-origin:center`} /></div>
           {:else if previewLoading}<div class="grid h-full place-items-center text-sm text-muted">正在加载 JPEG 预览…</div>
           {:else if currentPhoto}<div class="grid h-full place-items-center"><div class="max-w-sm text-center"><div class="text-5xl opacity-30">◇</div><h2 class="mt-4 text-lg font-medium">{currentPhoto.displayBaseName}</h2><p class="mt-2 text-sm text-muted">{currentPhoto.isMissing ? '源文件已丢失' : currentPhoto.pairStatus === 'conflict' ? '配对存在冲突，请处理后重新扫描' : '缺少 JPEG，ARW 第一版不提供预览'}</p>{#if currentPhoto.isMissing}<Button class="mt-5" variant="danger" size="sm" on:click={deleteCurrentMissing}>删除数据库记录</Button>{/if}</div></div>
           {:else}<div class="grid h-full place-items-center text-sm text-muted">扫描照片目录后，从左侧选择照片</div>{/if}
