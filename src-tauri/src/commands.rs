@@ -118,8 +118,8 @@ pub fn create_tag(
     parent_id: Option<i64>,
     name: String,
 ) -> Result<i64, String> {
-    let connection = db::connect(&state.project_path().command()?).command()?;
-    db::create_tag(&connection, parent_id, &name).command()
+    let mut connection = db::connect(&state.project_path().command()?).command()?;
+    db::create_tag_path(&mut connection, parent_id, &name).command()
 }
 
 #[tauri::command]
@@ -148,6 +148,16 @@ pub fn assign_tag(
 ) -> Result<(), String> {
     let connection = db::connect(&state.project_path().command()?).command()?;
     db::assign_tag(&connection, photo_id, tag_id).command()
+}
+
+#[tauri::command]
+pub fn set_photo_trashed(
+    state: State<'_, AppState>,
+    photo_id: i64,
+    trashed: bool,
+) -> Result<(), String> {
+    let connection = db::connect(&state.project_path().command()?).command()?;
+    db::set_photo_trashed(&connection, photo_id, trashed).command()
 }
 
 #[tauri::command]

@@ -51,6 +51,7 @@ pub struct PhotoEntry {
     pub location_group: Option<String>,
     pub similarity_group: Option<String>,
     pub is_similarity_hidden: bool,
+    pub is_trashed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -61,6 +62,7 @@ pub struct ProjectCounts {
     pub missing: i64,
     pub conflicts: i64,
     pub incomplete: i64,
+    pub trashed: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

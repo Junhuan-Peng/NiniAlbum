@@ -4,7 +4,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     error::{AppError, AppResult},
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
   sort_field TEXT NOT NULL DEFAULT 'file_name'
     CHECK (sort_field IN ('file_name','relative_path','modified_time','tagged_status','missing_status')),
   sort_direction TEXT NOT NULL DEFAULT 'asc' CHECK (sort_direction IN ('asc','desc')),
-  schema_version INTEGER NOT NULL DEFAULT 3,
+  schema_version INTEGER NOT NULL DEFAULT 4,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS photo_entries (
   location_group TEXT NULL,
   similarity_group TEXT NULL,
   is_similarity_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_similarity_hidden IN (0,1)),
+  is_trashed INTEGER NOT NULL DEFAULT 0 CHECK (is_trashed IN (0,1)),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(relative_dir, pairing_key)
@@ -152,6 +153,10 @@ const PHOTO_ENTRY_COLUMNS: &[(&str, &str)] = &[
         "is_similarity_hidden",
         "INTEGER NOT NULL DEFAULT 0 CHECK (is_similarity_hidden IN (0,1))",
     ),
+    (
+        "is_trashed",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (is_trashed IN (0,1))",
+    ),
 ];
 
 fn migrate(connection: &Connection) -> AppResult<()> {
@@ -172,7 +177,8 @@ fn migrate(connection: &Connection) -> AppResult<()> {
          CREATE INDEX IF NOT EXISTS idx_photo_date_group ON photo_entries(date_group);
          CREATE INDEX IF NOT EXISTS idx_photo_location_group ON photo_entries(location_group);
          CREATE INDEX IF NOT EXISTS idx_photo_similarity_group ON photo_entries(similarity_group);
-         UPDATE project_settings SET schema_version=3 WHERE id=1 AND schema_version<3;",
+         CREATE INDEX IF NOT EXISTS idx_photo_trashed ON photo_entries(is_trashed);
+         UPDATE project_settings SET schema_version=4 WHERE id=1 AND schema_version<4;",
     )?;
     Ok(())
 }
@@ -199,7 +205,7 @@ pub fn create_project(database_path: &Path, photo_root: &Path) -> AppResult<()> 
     connection.execute_batch(SCHEMA)?;
     migrate(&connection)?;
     connection.execute(
-        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 3)",
+        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 4)",
         [photo_root.to_string_lossy().as_ref()],
     )?;
     Ok(())
@@ -313,6 +319,53 @@ pub fn create_tag(connection: &Connection, parent_id: Option<i64>, name: &str) -
     Ok(connection.last_insert_rowid())
 }
 
+pub fn create_tag_path(
+    connection: &mut Connection,
+    parent_id: Option<i64>,
+    path: &str,
+) -> AppResult<i64> {
+    let raw_parts = path.split('/').collect::<Vec<_>>();
+    if raw_parts.is_empty() || raw_parts.iter().any(|part| part.trim().is_empty()) {
+        return Err(AppError::InvalidInput("标签路径不能包含空的层级".into()));
+    }
+    let parts = raw_parts
+        .into_iter()
+        .map(validate_tag_name)
+        .collect::<AppResult<Vec<_>>>()?;
+    if let Some(parent) = parent_id {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tag_tree WHERE id=?1)",
+            [parent],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::NotFound(format!("父标签 {parent}")));
+        }
+    }
+
+    let transaction = connection.transaction()?;
+    let mut current_parent = parent_id;
+    for (index, name) in parts.iter().enumerate() {
+        let existing = transaction
+            .query_row(
+                "SELECT id FROM tag_tree WHERE parent_id IS ?1 AND name=?2 COLLATE NOCASE",
+                params![current_parent, name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            if index + 1 == parts.len() {
+                return Err(AppError::InvalidInput(format!("同级标签“{name}”已存在")));
+            }
+            current_parent = Some(id);
+            continue;
+        }
+        current_parent = Some(create_tag(&transaction, current_parent, name)?);
+    }
+    transaction.commit()?;
+    current_parent.ok_or_else(|| AppError::InvalidInput("标签路径不能为空".into()))
+}
+
 pub fn rename_tag(connection: &Connection, id: i64, name: &str) -> AppResult<()> {
     let name = validate_tag_name(name)?;
     let changed = connection.execute(
@@ -367,6 +420,17 @@ pub fn assign_tag(connection: &Connection, photo_id: i64, tag_id: Option<i64>) -
     Ok(())
 }
 
+pub fn set_photo_trashed(connection: &Connection, photo_id: i64, trashed: bool) -> AppResult<()> {
+    let changed = connection.execute(
+        "UPDATE photo_entries SET is_trashed=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2",
+        params![i64::from(trashed), photo_id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::NotFound(format!("照片组 {photo_id}")));
+    }
+    Ok(())
+}
+
 pub fn list_tags(connection: &Connection) -> AppResult<Vec<TagNode>> {
     let mut statement = connection.prepare(
         "SELECT t.id,t.parent_id,t.name,t.sort_order,COUNT(p.id)
@@ -402,13 +466,16 @@ fn order_clause(field: &str, direction: &str) -> &'static str {
 
 fn filter_clause(filter: &str) -> &'static str {
     match filter {
-        "tagged" => "e.tag_id IS NOT NULL",
-        "untagged" => "e.tag_id IS NULL",
-        "complete" => "e.pair_status='complete' AND e.is_missing=0",
-        "incomplete" => "e.pair_status IN ('missing_jpeg','missing_raw') AND e.is_missing=0",
-        "conflict" => "e.pair_status='conflict' AND e.is_missing=0",
-        "missing" => "e.is_missing=1",
-        _ => "1=1",
+        "tagged" => "e.is_trashed=0 AND e.tag_id IS NOT NULL",
+        "untagged" => "e.is_trashed=0 AND e.tag_id IS NULL",
+        "complete" => "e.is_trashed=0 AND e.pair_status='complete' AND e.is_missing=0",
+        "incomplete" => {
+            "e.is_trashed=0 AND e.pair_status IN ('missing_jpeg','missing_raw') AND e.is_missing=0"
+        }
+        "conflict" => "e.is_trashed=0 AND e.pair_status='conflict' AND e.is_missing=0",
+        "missing" => "e.is_trashed=0 AND e.is_missing=1",
+        "trash" => "e.is_trashed=1",
+        _ => "e.is_trashed=0",
     }
 }
 
@@ -433,7 +500,7 @@ pub fn list_photos(connection: &Connection, query: &PhotoQuery) -> AppResult<Vec
         (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0) AS modified_time,
         e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
         e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
-        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden
+        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden,e.is_trashed
       FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
       WHERE {filter} ORDER BY {}"#,
         order_clause(field, direction)
@@ -482,14 +549,15 @@ fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhotoEntry> {
         location_group: row.get(26)?,
         similarity_group: row.get(27)?,
         is_similarity_hidden: row.get::<_, i64>(28)? != 0,
+        is_trashed: row.get::<_, i64>(29)? != 0,
     })
 }
 
 pub fn similarity_photos(connection: &Connection, photo_id: i64) -> AppResult<Vec<PhotoEntry>> {
-    let group: Option<String> = connection.query_row(
-        "SELECT similarity_group FROM photo_entries WHERE id=?1",
+    let (group, trashed): (Option<String>, i64) = connection.query_row(
+        "SELECT similarity_group,is_trashed FROM photo_entries WHERE id=?1",
         [photo_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let Some(group) = group else {
         return Ok(Vec::new());
@@ -505,11 +573,11 @@ pub fn similarity_photos(connection: &Connection, photo_id: i64) -> AppResult<Ve
           (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0),
           e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
           e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
-          e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden
+          e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden,e.is_trashed
         FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
-        WHERE e.similarity_group=?1 ORDER BY e.captured_at,e.id"#,
+        WHERE e.similarity_group=?1 AND e.is_trashed=?2 ORDER BY e.captured_at,e.id"#,
     )?;
-    let rows = statement.query_map([group], photo_from_row)?;
+    let rows = statement.query_map(params![group, trashed], photo_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
 }
 
@@ -531,12 +599,15 @@ pub fn set_similarity_hidden(
 
 pub fn counts(connection: &Connection) -> AppResult<ProjectCounts> {
     connection.query_row(
-        "SELECT COUNT(*), SUM(tag_id IS NOT NULL), SUM(is_missing=1),
-         SUM(pair_status='conflict'), SUM(pair_status IN ('missing_jpeg','missing_raw')) FROM photo_entries", [],
+        "SELECT COUNT(*), SUM(tag_id IS NOT NULL AND is_trashed=0), SUM(is_missing=1 AND is_trashed=0),
+         SUM(pair_status='conflict' AND is_trashed=0),
+         SUM(pair_status IN ('missing_jpeg','missing_raw') AND is_trashed=0),
+         SUM(is_trashed=1) FROM photo_entries", [],
         |r| Ok(ProjectCounts {
             total: r.get(0)?, tagged: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
             missing: r.get::<_, Option<i64>>(2)?.unwrap_or(0), conflicts: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
             incomplete: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            trashed: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
         })) .map_err(AppError::from)
 }
 
@@ -642,12 +713,13 @@ mod tests {
         assert!(columns.contains("captured_at"));
         assert!(columns.contains("similarity_group"));
         assert!(columns.contains("is_similarity_hidden"));
+        assert!(columns.contains("is_trashed"));
         let version: i64 = connection
             .query_row("SELECT schema_version FROM project_settings", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -703,5 +775,73 @@ mod tests {
                 .unwrap()
                 .is_similarity_hidden
         );
+    }
+
+    #[test]
+    fn creates_cascading_tag_paths_and_reuses_intermediate_tags() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',4)",
+                [],
+            )
+            .unwrap();
+
+        let first = create_tag_path(&mut connection, None, "青海/沿途").unwrap();
+        let second = create_tag_path(&mut connection, None, "青海/湖泊").unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tag_tree", [], |row| row.get(0))
+            .unwrap();
+        let shared_parent: (Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT (SELECT parent_id FROM tag_tree WHERE id=?1),
+                        (SELECT parent_id FROM tag_tree WHERE id=?2)",
+                params![first, second],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(shared_parent.0, shared_parent.1);
+        assert!(create_tag_path(&mut connection, None, "青海/沿途").is_err());
+        assert!(create_tag_path(&mut connection, None, "青海//无效").is_err());
+    }
+
+    #[test]
+    fn trash_filter_preserves_existing_tag() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',4)",
+                [],
+            )
+            .unwrap();
+        let tag_id = create_tag(&connection, None, "保留标签").unwrap();
+        connection
+            .execute(
+                "INSERT INTO photo_entries(relative_dir,pairing_key,display_base_name,tag_id)
+                 VALUES('','one','ONE',?1)",
+                [tag_id],
+            )
+            .unwrap();
+        let photo_id = connection.last_insert_rowid();
+
+        set_photo_trashed(&connection, photo_id, true).unwrap();
+        let regular = list_photos(&connection, &PhotoQuery::default()).unwrap();
+        let trash = list_photos(
+            &connection,
+            &PhotoQuery {
+                filter: Some("trash".into()),
+                ..PhotoQuery::default()
+            },
+        )
+        .unwrap();
+
+        assert!(regular.is_empty());
+        assert_eq!(trash.len(), 1);
+        assert!(trash[0].is_trashed);
+        assert_eq!(trash[0].tag_id, Some(tag_id));
     }
 }

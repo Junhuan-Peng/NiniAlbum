@@ -71,7 +71,7 @@ fn export_items(connection: &Connection) -> AppResult<Vec<ExportItem>> {
          )
          SELECT e.id,e.display_base_name,paths.path FROM photo_entries e
          JOIN paths ON paths.id=e.tag_id
-         WHERE e.is_missing=0 AND e.pair_status='complete' ORDER BY e.id")?;
+         WHERE e.is_missing=0 AND e.pair_status='complete' AND e.is_trashed=0 ORDER BY e.id")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -183,11 +183,20 @@ fn copy_pair(root: &Path, destination: &(PathBuf, PathBuf), item: &ExportItem) -
 }
 
 fn skip_counts(connection: &Connection) -> AppResult<(usize, usize, usize)> {
-    connection.query_row(
-        "SELECT SUM(tag_id IS NULL),SUM(tag_id IS NOT NULL AND pair_status!='complete' AND is_missing=0),SUM(tag_id IS NOT NULL AND is_missing=1) FROM photo_entries",
-        [], |row| Ok((row.get::<_,Option<i64>>(0)?.unwrap_or(0) as usize,
-                      row.get::<_,Option<i64>>(1)?.unwrap_or(0) as usize,
-                      row.get::<_,Option<i64>>(2)?.unwrap_or(0) as usize)))
+    connection
+        .query_row(
+            "SELECT SUM(tag_id IS NULL AND is_trashed=0),
+         SUM(tag_id IS NOT NULL AND pair_status!='complete' AND is_missing=0 AND is_trashed=0),
+         SUM(tag_id IS NOT NULL AND is_missing=1 AND is_trashed=0) FROM photo_entries",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0) as usize,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+                ))
+            },
+        )
         .map_err(AppError::from)
 }
 

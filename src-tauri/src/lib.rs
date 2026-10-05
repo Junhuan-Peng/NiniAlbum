@@ -25,6 +25,7 @@ pub fn run() {
             commands::inspect_tag_delete,
             commands::delete_tag,
             commands::assign_tag,
+            commands::set_photo_trashed,
             commands::save_sort,
             commands::delete_missing,
             commands::checkpoint,
