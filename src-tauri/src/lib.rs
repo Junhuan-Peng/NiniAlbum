@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod error;
+mod export;
 mod models;
 mod scan;
 
@@ -22,6 +23,8 @@ pub fn run() {
             commands::save_sort,
             commands::delete_missing,
             commands::checkpoint,
+            commands::plan_export,
+            commands::export_photos,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Nini Albums");

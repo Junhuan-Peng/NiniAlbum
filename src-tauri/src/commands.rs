@@ -5,7 +5,11 @@ use tauri::State;
 use crate::{
     db::{self, AppState},
     error::CommandResult,
-    models::{DeleteImpact, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary},
+    export,
+    models::{
+        DeleteImpact, ExportPlan, ExportSummary, PhotoQuery, ProjectInfo, ProjectSnapshot,
+        ScanSummary,
+    },
     scan,
 };
 
@@ -107,4 +111,27 @@ pub fn delete_missing(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize
 pub fn checkpoint(state: State<'_, AppState>) -> Result<(), String> {
     let connection = db::connect(&state.project_path().command()?).command()?;
     db::checkpoint(&connection).command()
+}
+
+#[tauri::command]
+pub fn plan_export(state: State<'_, AppState>, export_root: String) -> Result<ExportPlan, String> {
+    export::plan_export(
+        &state.project_path().command()?,
+        &PathBuf::from(export_root),
+    )
+    .command()
+}
+
+#[tauri::command]
+pub async fn export_photos(
+    state: State<'_, AppState>,
+    export_root: String,
+    strategy: String,
+) -> Result<ExportSummary, String> {
+    let database_path = state.project_path().command()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        export::export_photos(&database_path, &PathBuf::from(export_root), &strategy).command()
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }

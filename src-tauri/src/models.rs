@@ -91,3 +91,34 @@ pub struct DeleteImpact {
     pub tag_count: i64,
     pub affected_photos: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPlan {
+    pub eligible: usize,
+    pub conflicts: usize,
+    pub skipped_untagged: usize,
+    pub skipped_incomplete: usize,
+    pub skipped_missing: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFailure {
+    pub photo_id: i64,
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    pub succeeded: usize,
+    pub skipped: usize,
+    pub renamed: usize,
+    pub failed: usize,
+    pub skipped_untagged: usize,
+    pub skipped_incomplete: usize,
+    pub skipped_missing: usize,
+    pub failures: Vec<ExportFailure>,
+}
