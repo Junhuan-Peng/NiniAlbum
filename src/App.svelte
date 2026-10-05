@@ -438,10 +438,12 @@
   async function toggleCurrentTrashed() {
     if (!currentPhoto) return;
     const photo = currentPhoto;
+    const trashed = !photo.isTrashed;
     const nextId = photos[selectedIndex + 1]?.id ?? photos[selectedIndex - 1]?.id ?? null;
     try {
-      await api.setPhotoTrashed(photo.id, !photo.isTrashed);
+      await api.setPhotoTrashed(photo.id, trashed);
       await refresh(nextId);
+      toast(trashed ? `已将 ${photo.displayBaseName} 移入回收站。` : `已恢复 ${photo.displayBaseName}。`, 'success');
     } catch (error) { toast(errorMessage(error), 'error'); }
   }
 
@@ -494,7 +496,9 @@
     if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
     if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
     if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
-    if (currentPhoto && (event.key === 'Delete' || event.key === 'Backspace')) { event.preventDefault(); toggleCurrentTrashed(); return; }
+    const deletePressed = event.key === 'Delete' || event.key === 'Backspace'
+      || event.code === 'Delete' || event.code === 'Backspace';
+    if (currentPhoto && deletePressed) { event.preventDefault(); event.stopPropagation(); void toggleCurrentTrashed(); return; }
     if (event.key === 'ArrowDown') { event.preventDefault(); choosePhoto(Math.min(selectedIndex + 1, photos.length - 1)); }
     if (event.key === 'ArrowUp') { event.preventDefault(); choosePhoto(Math.max(selectedIndex - 1, 0)); }
     if (event.code === 'Space' && selectedTagId !== null) { event.preventDefault(); assignSelectedTag(selectedTagId, true); }
@@ -595,7 +599,7 @@
   });
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window on:keydown|capture={handleKeydown} />
 
 <main class="flex h-full min-h-0 flex-col bg-background text-foreground">
   <header class="flex h-16 shrink-0 items-center gap-3 border-b border-border bg-[#15171a] px-4">
@@ -608,7 +612,7 @@
       <div class="ml-1 h-6 w-px bg-border"></div>
       <button class="relative grid h-9 w-9 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-accent/40 hover:text-foreground disabled:opacity-40" disabled={busy} on:click={scanPhotos} aria-label="刷新照片目录" title={sourceChanged ? '检测到文件变化，点击刷新' : '刷新照片目录'}><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M20 11a8 8 0 0 0-14.9-4M4 4v5h5M4 13a8 8 0 0 0 14.9 4M20 20v-5h-5" /></svg>{#if sourceChanged}<span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#15171a] bg-amber-400"></span>{/if}</button>
       <button class="grid h-9 w-9 place-items-center rounded-lg border border-border bg-accent text-black hover:bg-[#e5ff83] disabled:opacity-40" disabled={busy} on:click={prepareExport} aria-label="批量导出" title="批量导出"><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M12 3v12m0-12 4 4m-4-4L8 7M5 14v6h14v-6" /></svg></button>
-      <button class:border-danger={filter === 'trash'} class:text-danger={filter === 'trash'} class="relative grid h-9 w-9 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-danger/60 hover:text-danger disabled:opacity-40" disabled={busy} on:click={toggleTrashView} aria-label={filter === 'trash' ? '返回照片列表' : '打开回收站'} title={filter === 'trash' ? '返回照片列表' : `回收站（${snapshot.counts.trashed}）`}><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" /></svg>{#if snapshot.counts.trashed > 0}<span class="absolute -right-1 -top-1 min-w-4 rounded-full bg-danger px-1 text-[8px] font-bold leading-4 text-white">{snapshot.counts.trashed}</span>{/if}</button>
+      <button class:border-danger={filter === 'trash'} class:text-danger={filter === 'trash'} class="flex h-9 items-center gap-2 rounded-lg border border-border bg-[#22252a] px-3 text-xs text-muted hover:border-danger/60 hover:text-danger disabled:opacity-40" disabled={busy} on:click={toggleTrashView} aria-label={filter === 'trash' ? '返回照片列表' : '打开回收站'} title={filter === 'trash' ? '返回照片列表' : '打开回收站'}><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" /></svg><span>{filter === 'trash' ? '返回照片' : '回收站'}</span>{#if snapshot.counts.trashed > 0}<span class="min-w-4 rounded-full bg-danger px-1 text-center text-[8px] font-bold leading-4 text-white">{snapshot.counts.trashed}</span>{/if}</button>
     {/if}
     <button class="ml-auto grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-[#444952] hover:text-foreground" on:click={openSettings} aria-label="设置" title="设置"><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
     <div class="flex shrink-0 items-center gap-2 text-xs text-muted">{#if busy}<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-r-transparent"></span><span class="max-w-48 truncate">{busyLabel}</span>{/if}</div>
@@ -670,7 +674,7 @@
       </section>
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('right', event)} aria-label="调整标签面板宽度"></button>
       <aside class="flex min-h-0 flex-col border-l border-border bg-panel">
-        <div class="border-b border-border p-3"><div class="flex items-center justify-between gap-2"><div class="text-[10px] font-semibold uppercase tracking-[.18em] text-muted">当前照片标签</div>{#if currentPhoto}<button class="rounded border border-border px-2 py-1 text-[9px] text-muted hover:border-danger/60 hover:text-danger" on:click={toggleCurrentTrashed} title="快捷键：Delete">{currentPhoto.isTrashed ? '恢复照片' : '标记删除'}</button>{/if}</div><div class="mt-1 flex min-h-5 items-center gap-2 truncate text-sm text-accent"><span class="truncate">{currentPhoto?.tagPath ?? '未标记'}</span>{#if currentPhoto?.isTrashed}<span class="shrink-0 rounded bg-danger/15 px-1.5 py-0.5 text-[9px] text-danger">回收站</span>{/if}</div></div>
+        <div class="border-b border-border p-3"><div class="flex items-center justify-between gap-2"><div class="text-[10px] font-semibold uppercase tracking-[.18em] text-muted">当前照片标签</div>{#if currentPhoto}<button class="rounded border border-border px-2 py-1 text-[9px] text-muted hover:border-danger/60 hover:text-danger" on:click={toggleCurrentTrashed} title="快捷键：Delete / Backspace">{currentPhoto.isTrashed ? '恢复照片' : '标记删除'}</button>{/if}</div><div class="mt-1 flex min-h-5 items-center gap-2 truncate text-sm text-accent"><span class="truncate">{currentPhoto?.tagPath ?? '未标记'}</span>{#if currentPhoto?.isTrashed}<span class="shrink-0 rounded bg-danger/15 px-1.5 py-0.5 text-[9px] text-danger">回收站</span>{/if}</div></div>
         <details class="group border-b border-border" open>
           <summary class="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-[10px] font-semibold uppercase tracking-[.18em] text-muted"><span>EXIF 信息</span><span class="transition-transform group-open:rotate-180">⌄</span></summary>
           {#if currentPhoto}
