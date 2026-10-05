@@ -17,6 +17,8 @@ pub fn run() {
             commands::get_snapshot,
             commands::scan_project,
             commands::get_photo_preview,
+            commands::get_similarity_photos,
+            commands::set_similarity_hidden,
             commands::create_tag,
             commands::rename_tag,
             commands::inspect_tag_delete,

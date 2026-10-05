@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
   sort_field TEXT NOT NULL DEFAULT 'file_name'
     CHECK (sort_field IN ('file_name','relative_path','modified_time','tagged_status','missing_status')),
   sort_direction TEXT NOT NULL DEFAULT 'asc' CHECK (sort_direction IN ('asc','desc')),
-  schema_version INTEGER NOT NULL DEFAULT 2,
+  schema_version INTEGER NOT NULL DEFAULT 3,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS photo_entries (
   date_group TEXT NULL,
   location_group TEXT NULL,
   similarity_group TEXT NULL,
+  is_similarity_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_similarity_hidden IN (0,1)),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(relative_dir, pairing_key)
@@ -147,6 +148,10 @@ const PHOTO_ENTRY_COLUMNS: &[(&str, &str)] = &[
     ("date_group", "TEXT NULL"),
     ("location_group", "TEXT NULL"),
     ("similarity_group", "TEXT NULL"),
+    (
+        "is_similarity_hidden",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (is_similarity_hidden IN (0,1))",
+    ),
 ];
 
 fn migrate(connection: &Connection) -> AppResult<()> {
@@ -167,7 +172,7 @@ fn migrate(connection: &Connection) -> AppResult<()> {
          CREATE INDEX IF NOT EXISTS idx_photo_date_group ON photo_entries(date_group);
          CREATE INDEX IF NOT EXISTS idx_photo_location_group ON photo_entries(location_group);
          CREATE INDEX IF NOT EXISTS idx_photo_similarity_group ON photo_entries(similarity_group);
-         UPDATE project_settings SET schema_version=2 WHERE id=1 AND schema_version<2;",
+         UPDATE project_settings SET schema_version=3 WHERE id=1 AND schema_version<3;",
     )?;
     Ok(())
 }
@@ -194,7 +199,7 @@ pub fn create_project(database_path: &Path, photo_root: &Path) -> AppResult<()> 
     connection.execute_batch(SCHEMA)?;
     migrate(&connection)?;
     connection.execute(
-        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 2)",
+        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 3)",
         [photo_root.to_string_lossy().as_ref()],
     )?;
     Ok(())
@@ -439,53 +444,100 @@ pub fn list_photos(connection: &Connection, query: &PhotoQuery) -> AppResult<Vec
         (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0) AS modified_time,
         e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
         e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
-        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group
+        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden
       FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
       WHERE {filter} ORDER BY {}"#,
         order_clause(field, direction)
     );
     let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map([], |row| {
-        let blob: Option<Vec<u8>> = row.get(10)?;
-        let mime: Option<String> = row.get(11)?;
-        let thumbnail_data_url = blob.map(|bytes| {
-            format!(
-                "data:{};base64,{}",
-                mime.as_deref().unwrap_or("image/jpeg"),
-                STANDARD.encode(bytes)
-            )
-        });
-        Ok(PhotoEntry {
-            id: row.get(0)?,
-            relative_dir: row.get(1)?,
-            display_base_name: row.get(2)?,
-            pair_status: row.get(3)?,
-            is_missing: row.get::<_, i64>(4)? != 0,
-            tag_id: row.get(5)?,
-            tag_path: row.get(6)?,
-            jpeg_relative_path: row.get(7)?,
-            raw_relative_path: row.get(8)?,
-            modified_time: row.get(9)?,
-            thumbnail_data_url,
-            pixel_width: row.get(12)?,
-            pixel_height: row.get(13)?,
-            orientation: row.get(14)?,
-            captured_at: row.get(15)?,
-            camera_make: row.get(16)?,
-            camera_model: row.get(17)?,
-            lens_model: row.get(18)?,
-            exposure_time: row.get(19)?,
-            aperture: row.get(20)?,
-            iso: row.get(21)?,
-            focal_length: row.get(22)?,
-            latitude: row.get(23)?,
-            longitude: row.get(24)?,
-            date_group: row.get(25)?,
-            location_group: row.get(26)?,
-            similarity_group: row.get(27)?,
-        })
-    })?;
+    let rows = statement.query_map([], photo_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhotoEntry> {
+    let blob: Option<Vec<u8>> = row.get(10)?;
+    let mime: Option<String> = row.get(11)?;
+    let thumbnail_data_url = blob.map(|bytes| {
+        format!(
+            "data:{};base64,{}",
+            mime.as_deref().unwrap_or("image/jpeg"),
+            STANDARD.encode(bytes)
+        )
+    });
+    Ok(PhotoEntry {
+        id: row.get(0)?,
+        relative_dir: row.get(1)?,
+        display_base_name: row.get(2)?,
+        pair_status: row.get(3)?,
+        is_missing: row.get::<_, i64>(4)? != 0,
+        tag_id: row.get(5)?,
+        tag_path: row.get(6)?,
+        jpeg_relative_path: row.get(7)?,
+        raw_relative_path: row.get(8)?,
+        modified_time: row.get(9)?,
+        thumbnail_data_url,
+        pixel_width: row.get(12)?,
+        pixel_height: row.get(13)?,
+        orientation: row.get(14)?,
+        captured_at: row.get(15)?,
+        camera_make: row.get(16)?,
+        camera_model: row.get(17)?,
+        lens_model: row.get(18)?,
+        exposure_time: row.get(19)?,
+        aperture: row.get(20)?,
+        iso: row.get(21)?,
+        focal_length: row.get(22)?,
+        latitude: row.get(23)?,
+        longitude: row.get(24)?,
+        date_group: row.get(25)?,
+        location_group: row.get(26)?,
+        similarity_group: row.get(27)?,
+        is_similarity_hidden: row.get::<_, i64>(28)? != 0,
+    })
+}
+
+pub fn similarity_photos(connection: &Connection, photo_id: i64) -> AppResult<Vec<PhotoEntry>> {
+    let group: Option<String> = connection.query_row(
+        "SELECT similarity_group FROM photo_entries WHERE id=?1",
+        [photo_id],
+        |row| row.get(0),
+    )?;
+    let Some(group) = group else {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection.prepare(
+        r#"WITH RECURSIVE paths(id,path) AS (
+          SELECT id,name FROM tag_tree WHERE parent_id IS NULL
+          UNION ALL SELECT t.id, paths.path || ' > ' || t.name FROM tag_tree t JOIN paths ON t.parent_id=paths.id
+        )
+        SELECT e.id,e.relative_dir,e.display_base_name,e.pair_status,e.is_missing,e.tag_id,paths.path,
+          (SELECT relative_path FROM photo_files WHERE photo_entry_id=e.id AND file_kind='jpeg' AND is_missing=0 ORDER BY id LIMIT 1),
+          (SELECT relative_path FROM photo_files WHERE photo_entry_id=e.id AND file_kind='arw' AND is_missing=0 ORDER BY id LIMIT 1),
+          (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0),
+          e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
+          e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
+          e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden
+        FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
+        WHERE e.similarity_group=?1 ORDER BY e.captured_at,e.id"#,
+    )?;
+    let rows = statement.query_map([group], photo_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+pub fn set_similarity_hidden(
+    connection: &Connection,
+    photo_id: i64,
+    hidden: bool,
+) -> AppResult<()> {
+    let changed = connection.execute(
+        "UPDATE photo_entries SET is_similarity_hidden=?1,updated_at=CURRENT_TIMESTAMP
+         WHERE id=?2 AND similarity_group IS NOT NULL",
+        params![i64::from(hidden), photo_id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::NotFound(format!("相似照片 {photo_id}")));
+    }
+    Ok(())
 }
 
 pub fn counts(connection: &Connection) -> AppResult<ProjectCounts> {
@@ -600,12 +652,13 @@ mod tests {
             .unwrap();
         assert!(columns.contains("captured_at"));
         assert!(columns.contains("similarity_group"));
+        assert!(columns.contains("is_similarity_hidden"));
         let version: i64 = connection
             .query_row("SELECT schema_version FROM project_settings", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -627,5 +680,39 @@ mod tests {
             .unwrap();
         assert_eq!(tags, 0);
         assert!(photos.is_dir());
+    }
+
+    #[test]
+    fn similarity_visibility_is_persisted_and_group_members_are_returned() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',3)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO photo_entries(relative_dir,pairing_key,display_base_name,similarity_group)
+                 VALUES('','one','ONE','相似组 001'),('','two','TWO','相似组 001')",
+                [],
+            )
+            .unwrap();
+        let first_id: i64 = connection
+            .query_row("SELECT MIN(id) FROM photo_entries", [], |row| row.get(0))
+            .unwrap();
+
+        set_similarity_hidden(&connection, first_id, true).unwrap();
+        let members = similarity_photos(&connection, first_id).unwrap();
+
+        assert_eq!(members.len(), 2);
+        assert!(
+            members
+                .iter()
+                .find(|photo| photo.id == first_id)
+                .unwrap()
+                .is_similarity_hidden
+        );
     }
 }

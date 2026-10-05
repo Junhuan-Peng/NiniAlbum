@@ -740,6 +740,10 @@ fn refresh_smart_groups(transaction: &Transaction<'_>) -> AppResult<()> {
             )?;
         }
     }
+    transaction.execute(
+        "UPDATE photo_entries SET is_similarity_hidden=0 WHERE similarity_group IS NULL",
+        [],
+    )?;
     Ok(())
 }
 

@@ -86,6 +86,25 @@ pub async fn get_photo_preview(
 }
 
 #[tauri::command]
+pub fn get_similarity_photos(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<Vec<crate::models::PhotoEntry>, String> {
+    let connection = db::connect(&state.project_path().command()?).command()?;
+    db::similarity_photos(&connection, photo_id).command()
+}
+
+#[tauri::command]
+pub fn set_similarity_hidden(
+    state: State<'_, AppState>,
+    photo_id: i64,
+    hidden: bool,
+) -> Result<(), String> {
+    let connection = db::connect(&state.project_path().command()?).command()?;
+    db::set_similarity_hidden(&connection, photo_id, hidden).command()
+}
+
+#[tauri::command]
 pub fn create_tag(
     state: State<'_, AppState>,
     parent_id: Option<i64>,

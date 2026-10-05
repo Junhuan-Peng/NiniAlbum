@@ -50,6 +50,7 @@ pub struct PhotoEntry {
     pub date_group: Option<String>,
     pub location_group: Option<String>,
     pub similarity_group: Option<String>,
+    pub is_similarity_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
