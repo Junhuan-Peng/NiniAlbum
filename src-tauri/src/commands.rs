@@ -75,6 +75,14 @@ pub async fn scan_project(
 }
 
 #[tauri::command]
+pub async fn photo_root_has_changes(state: State<'_, AppState>) -> Result<bool, String> {
+    let path = state.project_path().command()?;
+    tauri::async_runtime::spawn_blocking(move || scan::photo_root_has_changes(&path).command())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn get_photo_preview(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -162,12 +170,6 @@ pub fn delete_missing(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize
 pub fn checkpoint(state: State<'_, AppState>) -> Result<(), String> {
     let connection = db::connect(&state.project_path().command()?).command()?;
     db::checkpoint(&connection).command()
-}
-
-#[tauri::command]
-pub fn set_photo_root(state: State<'_, AppState>, photo_root: String) -> Result<(), String> {
-    let connection = db::connect(&state.project_path().command()?).command()?;
-    db::set_photo_root(&connection, &PathBuf::from(photo_root)).command()
 }
 
 #[tauri::command]

@@ -16,6 +16,7 @@ pub fn run() {
             commands::open_project,
             commands::get_snapshot,
             commands::scan_project,
+            commands::photo_root_has_changes,
             commands::get_photo_preview,
             commands::get_similarity_photos,
             commands::set_similarity_hidden,
@@ -27,7 +28,6 @@ pub fn run() {
             commands::save_sort,
             commands::delete_missing,
             commands::checkpoint,
-            commands::set_photo_root,
             commands::plan_export,
             commands::export_photos,
         ])

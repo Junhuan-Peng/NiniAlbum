@@ -265,17 +265,6 @@ pub fn project_info(connection: &Connection, database_path: &Path) -> AppResult<
         .map_err(AppError::from)
 }
 
-pub fn set_photo_root(connection: &Connection, photo_root: &Path) -> AppResult<()> {
-    if !photo_root.is_dir() {
-        return Err(AppError::InvalidPhotoRoot(photo_root.to_path_buf()));
-    }
-    connection.execute(
-        "UPDATE project_settings SET photo_root=?1,updated_at=CURRENT_TIMESTAMP WHERE id=1",
-        [photo_root.to_string_lossy().as_ref()],
-    )?;
-    Ok(())
-}
-
 pub fn validate_tag_name(name: &str) -> AppResult<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {

@@ -579,6 +579,58 @@ pub fn photo_preview(database_path: &Path, photo_id: i64) -> AppResult<String> {
     Ok(format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)))
 }
 
+pub fn photo_root_has_changes(database_path: &Path) -> AppResult<bool> {
+    let connection = db::connect(database_path)?;
+    let root: String = connection.query_row(
+        "SELECT photo_root FROM project_settings WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let root = PathBuf::from(root);
+    if !root.is_dir() {
+        return Ok(true);
+    }
+    let mut statement = connection.prepare(
+        "SELECT relative_path,file_size,modified_time FROM photo_files WHERE is_missing=0",
+    )?;
+    let known = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)? as u64, row.get::<_, f64>(2)?),
+            ))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    drop(statement);
+    let mut seen = 0_usize;
+    for item in WalkDir::new(&root).follow_links(false) {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(_) => return Ok(true),
+        };
+        if !entry.file_type().is_file() || file_kind(entry.path()).is_none() {
+            continue;
+        }
+        seen += 1;
+        let Ok(relative) = entry.path().strip_prefix(&root) else {
+            return Ok(true);
+        };
+        let relative = relative.to_string_lossy();
+        let Some((known_size, known_modified)) = known.get(relative.as_ref()) else {
+            return Ok(true);
+        };
+        let Ok(metadata) = entry.metadata() else {
+            return Ok(true);
+        };
+        if metadata.len() != *known_size
+            || (modified_time(&metadata) - known_modified).abs() > 0.001
+        {
+            return Ok(true);
+        }
+    }
+    Ok(seen != known.len())
+}
+
 fn destination_entry(
     transaction: &Transaction<'_>,
     group: &ScannedGroup,
@@ -1023,11 +1075,13 @@ mod tests {
         let tag_id = db::create_tag(&connection, None, "旅行").unwrap();
         db::assign_tag(&connection, entry_id, Some(tag_id)).unwrap();
         drop(connection);
+        assert!(!photo_root_has_changes(&database).unwrap());
 
         let moved = root.join("day-two");
         std::fs::create_dir_all(&moved).unwrap();
         std::fs::rename(&jpeg, moved.join("DSC0001.JPG")).unwrap();
         std::fs::rename(&raw, moved.join("dsc0001.arw")).unwrap();
+        assert!(photo_root_has_changes(&database).unwrap());
         let second = scan_project(&database).unwrap();
         assert_eq!(second.moved_files, 2);
         let connection = db::connect(&database).unwrap();
@@ -1042,6 +1096,7 @@ mod tests {
         assert_eq!(state.1, Some(tag_id));
         assert_eq!(PathBuf::from(state.2), PathBuf::from("day-two"));
         assert_eq!(state.3, 0);
+        assert!(!photo_root_has_changes(&database).unwrap());
     }
 
     #[test]
