@@ -24,7 +24,8 @@
     >
       <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-40"></span>
       <span class="truncate">{tag.name}</span>
-      {#if tag.photoCount}<span class="ml-auto text-[10px] tabular-nums text-muted">{tag.photoCount}</span>{/if}
+      {#if tag.shortcutKey}<kbd class="ml-auto min-w-5 rounded border border-current/25 bg-black/20 px-1 text-center text-[9px] font-medium leading-5 opacity-80">{tag.shortcutKey}</kbd>{/if}
+      {#if tag.photoCount}<span class:text-muted={!tag.shortcutKey} class:ml-auto={!tag.shortcutKey} class="text-[10px] tabular-nums">{tag.photoCount}</span>{/if}
     </button>
   </div>
   {#if expanded}
@@ -38,4 +39,3 @@
   .selected { background: rgba(217, 255, 91, .09); color: #d9ff5b; }
   .assigned { box-shadow: inset 2px 0 #d9ff5b; }
 </style>
-

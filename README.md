@@ -36,6 +36,7 @@ npm run tauri build
 - SQLite 启用外键和 WAL，标签及扫描操作即时持久化。
 - 缩略图写入数据库；ARW 不解码、不生成预览。
 - 标签名称可用 `/` 一次创建多级路径；照片可软标记为待删除并在回收站恢复，源文件不会被删除。
+- 每个项目可为标签绑定唯一的数字快捷键 `1`–`9`，浏览时按数字即可立即分配标签。
 - 数据库结构版本存放在 `project_settings.schema_version`。后续结构变更应增加版本并执行向前迁移，不能删除旧数据库。
 
 完整产品和数据规则见 [photo_tagger_vibe_prompt.md](./photo_tagger_vibe_prompt.md)。

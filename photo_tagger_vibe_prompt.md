@@ -67,6 +67,7 @@
 - 新建标签时支持用 `/` 分隔并在单个事务中创建多级路径；已有中间层自动复用，空层级和末级重名拒绝保存；
 - 单击标签立即分配给当前照片组；
 - 按空格将当前选中的标签再次分配给当前照片组，然后自动跳到下一张；
+- 任意父节点或叶子节点都可绑定项目内唯一的数字快捷键 `1`–`9`；按数字立即分配对应标签但不自动跳转，绑定关系写入 SQLite；
 - 修改标签名称只更新标签表，不批量改写照片记录；
 - 删除未被引用的标签时，同时级联删除其子节点，但必须先检查整个子树是否被照片引用；
 - 如果待删除节点或其任一子节点已被照片引用，弹窗提供“取消删除”或“将相关照片设为未标记并删除整个标签子树”；
@@ -103,7 +104,7 @@ CREATE TABLE project_settings (
     )),
   sort_direction TEXT NOT NULL DEFAULT 'asc'
     CHECK (sort_direction IN ('asc', 'desc')),
-  schema_version INTEGER NOT NULL DEFAULT 4,
+  schema_version INTEGER NOT NULL DEFAULT 5,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -120,6 +121,8 @@ CREATE TABLE tag_tree (
     REFERENCES tag_tree(id) ON DELETE CASCADE,
   name TEXT NOT NULL CHECK (length(trim(name)) > 0),
   sort_order INTEGER NOT NULL DEFAULT 0,
+  shortcut_key TEXT NULL
+    CHECK (shortcut_key IS NULL OR shortcut_key GLOB '[1-9]'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -134,6 +137,10 @@ CREATE UNIQUE INDEX idx_tag_root_name
 
 CREATE INDEX idx_tag_parent_sort
   ON tag_tree(parent_id, sort_order, name);
+
+CREATE UNIQUE INDEX idx_tag_shortcut_key
+  ON tag_tree(shortcut_key)
+  WHERE shortcut_key IS NOT NULL;
 ```
 
 不能依赖外键级联直接处理已使用标签。删除前必须由业务层递归检查整个子树的引用情况，并按用户选择执行事务。
@@ -355,6 +362,7 @@ SELECT path FROM tag_path WHERE id = ?1;
 
 - `↑` / `↓`：上一张或下一张照片组；
 - `Space`：重复分配当前选中标签并跳到下一张；
+- `1`–`9`：立即分配项目内绑定到该数字的标签，不自动跳转；每个数字在项目内只能绑定一个标签，`0` 保留为预览复位；
 - `Delete` / macOS `Backspace`：将当前照片移入回收站；在回收站中再次按下则恢复；
 - 设置对话框集中管理软件设置，包括自动保存开关和保存间隔；
 - 输入框、弹窗或可编辑控件获得焦点时，不触发照片快捷键。

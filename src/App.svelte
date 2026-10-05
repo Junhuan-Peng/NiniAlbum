@@ -30,6 +30,8 @@
   let rightWidth = 310;
   let tagDialog: 'root' | 'child' | 'rename' | null = null;
   let tagName = '';
+  let shortcutDialog: TagNode | null = null;
+  let shortcutKey = '';
   let deleteDialog: { tag: TagNode; impact: DeleteImpact } | null = null;
   let exportDialog: { root: string; plan: ExportPlan; strategy: 'skip' | 'overwrite' | 'rename' } | null = null;
   let existingProjectDialog: { databasePath: string; photoRoot: string } | null = null;
@@ -429,6 +431,26 @@
     } catch (error) { toast(errorMessage(error), 'error'); }
   }
 
+  function openShortcutDialog() {
+    if (!selectedTag) { toast('请先选择一个标签。'); return; }
+    shortcutDialog = selectedTag;
+    shortcutKey = selectedTag.shortcutKey ?? '';
+  }
+
+  function shortcutOwner(key: string) {
+    return snapshot?.tags.find((tag) => tag.shortcutKey === key && tag.id !== shortcutDialog?.id) ?? null;
+  }
+
+  async function saveTagShortcut() {
+    if (!shortcutDialog) return;
+    try {
+      await api.setTagShortcut(shortcutDialog.id, shortcutKey || null);
+      const photoId = currentPhoto?.id ?? null;
+      shortcutDialog = null;
+      await refresh(photoId);
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
   async function toggleTrashView() {
     filter = filter === 'trash' ? 'all' : 'trash';
     smartKind = 'none'; smartGroup = ''; selectedIndex = 0;
@@ -492,10 +514,14 @@
   function handleKeydown(event: KeyboardEvent) {
     const target = event.target as HTMLElement;
     if (['INPUT','TEXTAREA','SELECT'].includes(target.tagName) || target.isContentEditable) return;
-    if (!snapshot || tagDialog || deleteDialog || exportDialog || existingProjectDialog || settingsDialog) return;
+    if (!snapshot || tagDialog || shortcutDialog || deleteDialog || exportDialog || existingProjectDialog || settingsDialog) return;
     if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
     if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
     if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
+    if (!event.repeat && !event.metaKey && !event.ctrlKey && !event.altKey && /^[1-9]$/.test(event.key)) {
+      const tag = snapshot.tags.find((item) => item.shortcutKey === event.key);
+      if (tag && currentPhoto) { event.preventDefault(); void assignSelectedTag(tag.id); return; }
+    }
     const deletePressed = event.key === 'Delete' || event.key === 'Backspace'
       || event.code === 'Delete' || event.code === 'Backspace';
     if (currentPhoto && deletePressed) { event.preventDefault(); event.stopPropagation(); void toggleCurrentTrashed(); return; }
@@ -692,9 +718,9 @@
             </div>
           {:else}<p class="px-3 pb-3 text-[10px] text-muted">选择照片后显示 EXIF。</p>{/if}
         </details>
-        <div class="flex flex-wrap gap-1 border-b border-border p-2"><Button size="sm" on:click={() => startTagDialog('root')}>＋根标签</Button><Button size="sm" disabled={!selectedTag} on:click={() => startTagDialog('child')}>＋子标签</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={() => startTagDialog('rename')}>重命名</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={inspectDelete}>删除</Button></div>
+        <div class="flex flex-wrap gap-1 border-b border-border p-2"><Button size="sm" on:click={() => startTagDialog('root')}>＋根标签</Button><Button size="sm" disabled={!selectedTag} on:click={() => startTagDialog('child')}>＋子标签</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={() => startTagDialog('rename')}>重命名</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={openShortcutDialog}>快捷键</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={inspectDelete}>删除</Button></div>
         <div class="min-h-0 flex-1 overflow-y-auto py-2">{#each roots as root (root.id)}<TagBranch tag={root} tags={snapshot.tags} selectedId={selectedTagId} assignedId={currentPhoto?.tagId ?? null} onSelect={(id) => assignSelectedTag(id)} />{:else}<div class="p-5 text-center text-xs text-muted">创建第一个层级标签</div>{/each}</div>
-        <div class="border-t border-border p-3 text-[10px] leading-5 text-muted">单击立即分配 · 空格重复分配并前进<br />↑ ↓ 切换照片 · ⌘/Ctrl+S 同步</div>
+        <div class="border-t border-border p-3 text-[10px] leading-5 text-muted">单击或 1–9 快捷键立即分配<br />空格重复分配并前进 · ↑ ↓ 切换照片</div>
       </aside>
     </section>
     <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{currentListIndex >= 0 ? currentListIndex + 1 : '组内'} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span>{#if hiddenSimilarityCount}<span>相似图隐藏 {hiddenSimilarityCount}</span>{/if}<span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span>{#if snapshot.counts.trashed}<span class="text-danger">回收站 {snapshot.counts.trashed}</span>{/if}<span class="ml-auto max-w-[35%] truncate">{snapshot.project.photoRoot}</span></footer>
@@ -704,6 +730,8 @@
 </main>
 
 {#if tagDialog}<Modal title={tagDialog === 'root' ? '新建根标签' : tagDialog === 'child' ? '新建子标签' : '重命名标签'} on:close={() => tagDialog = null}><form on:submit|preventDefault={submitTag}><label class="mb-1.5 block text-xs text-muted" for="tag-name">{tagDialog === 'rename' ? '标签名称' : '标签名称或路径'}</label><input id="tag-name" bind:value={tagName} use:focusOnMount class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm outline-none focus:border-accent" placeholder={tagDialog === 'rename' ? '例如：风景' : '例如：青海/沿途'} /><p class="mt-2 text-[11px] text-muted">{tagDialog === 'rename' ? '同级名称必须唯一，不能包含跨平台文件名非法字符。' : '使用 / 可一次创建多级标签；已有中间层会自动复用。'}</p><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => tagDialog = null}>取消</Button><Button type="submit" variant="primary">保存</Button></div></form></Modal>{/if}
+
+{#if shortcutDialog}<Modal title="标签快捷键" description={`为“${shortcutDialog.name}”绑定数字键`} on:close={() => shortcutDialog = null}><form on:submit|preventDefault={saveTagShortcut}><label class="mb-1.5 block text-xs text-muted" for="tag-shortcut">快捷键</label><select id="tag-shortcut" bind:value={shortcutKey} use:focusOnMount class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm outline-none focus:border-accent"><option value="">不绑定</option>{#each ['1','2','3','4','5','6','7','8','9'] as key}{@const owner = shortcutOwner(key)}<option value={key} disabled={Boolean(owner)}>{key}{owner ? ` · 已绑定 ${owner.name}` : ''}</option>{/each}</select><p class="mt-2 text-[11px] leading-5 text-muted">数字 1–9 在项目内唯一。浏览照片时按下数字会立即分配标签；不会自动跳到下一张。</p><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => shortcutDialog = null}>取消</Button><Button type="submit" variant="primary">保存</Button></div></form></Modal>{/if}
 
 {#if deleteDialog}<Modal title="删除标签" description={`将删除“${deleteDialog.tag.name}”及其 ${deleteDialog.impact.tagCount - 1} 个子标签。`} on:close={() => deleteDialog = null}>{#if deleteDialog.impact.affectedPhotos > 0}<p class="rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm">标签子树正在被 <strong>{deleteDialog.impact.affectedPhotos}</strong> 张照片使用。请选择取消，或先将这些照片设为未标记再删除。</p>{:else}<p class="text-sm text-muted">该标签子树没有照片引用，可以安全删除。</p>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => deleteDialog = null}>不删除</Button><Button variant="danger" on:click={confirmDelete}>{deleteDialog.impact.affectedPhotos > 0 ? '取消标记并删除' : '确认删除'}</Button></div></Modal>{/if}
 

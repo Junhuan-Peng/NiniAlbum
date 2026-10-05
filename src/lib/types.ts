@@ -16,6 +16,7 @@ export interface TagNode {
   name: string;
   sortOrder: number;
   photoCount: number;
+  shortcutKey: string | null;
 }
 
 export interface PhotoEntry {
