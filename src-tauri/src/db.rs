@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
   sort_field TEXT NOT NULL DEFAULT 'file_name'
     CHECK (sort_field IN ('file_name','relative_path','modified_time','tagged_status','missing_status')),
   sort_direction TEXT NOT NULL DEFAULT 'asc' CHECK (sort_direction IN ('asc','desc')),
-  schema_version INTEGER NOT NULL DEFAULT 4,
+  schema_version INTEGER NOT NULL DEFAULT 5,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS tag_tree (
   parent_id INTEGER NULL REFERENCES tag_tree(id) ON DELETE CASCADE,
   name TEXT NOT NULL CHECK (length(trim(name)) > 0),
   sort_order INTEGER NOT NULL DEFAULT 0,
+  shortcut_key TEXT NULL CHECK (shortcut_key IS NULL OR shortcut_key GLOB '[1-9]'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -172,13 +173,26 @@ fn migrate(connection: &Connection) -> AppResult<()> {
             ))?;
         }
     }
+    let mut statement = connection.prepare("PRAGMA table_info(tag_tree)")?;
+    let tag_columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    drop(statement);
+    if !tag_columns.contains("shortcut_key") {
+        connection.execute_batch(
+            "ALTER TABLE tag_tree ADD COLUMN shortcut_key TEXT NULL
+             CHECK (shortcut_key IS NULL OR shortcut_key GLOB '[1-9]');",
+        )?;
+    }
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_photo_captured_at ON photo_entries(captured_at);
          CREATE INDEX IF NOT EXISTS idx_photo_date_group ON photo_entries(date_group);
          CREATE INDEX IF NOT EXISTS idx_photo_location_group ON photo_entries(location_group);
          CREATE INDEX IF NOT EXISTS idx_photo_similarity_group ON photo_entries(similarity_group);
          CREATE INDEX IF NOT EXISTS idx_photo_trashed ON photo_entries(is_trashed);
-         UPDATE project_settings SET schema_version=4 WHERE id=1 AND schema_version<4;",
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_shortcut_key
+           ON tag_tree(shortcut_key) WHERE shortcut_key IS NOT NULL;
+         UPDATE project_settings SET schema_version=5 WHERE id=1 AND schema_version<5;",
     )?;
     Ok(())
 }
@@ -205,7 +219,7 @@ pub fn create_project(database_path: &Path, photo_root: &Path) -> AppResult<()> 
     connection.execute_batch(SCHEMA)?;
     migrate(&connection)?;
     connection.execute(
-        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 4)",
+        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 5)",
         [photo_root.to_string_lossy().as_ref()],
     )?;
     Ok(())
@@ -420,6 +434,43 @@ pub fn assign_tag(connection: &Connection, photo_id: i64, tag_id: Option<i64>) -
     Ok(())
 }
 
+pub fn set_tag_shortcut(
+    connection: &Connection,
+    tag_id: i64,
+    shortcut_key: Option<&str>,
+) -> AppResult<()> {
+    let shortcut_key = shortcut_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if shortcut_key
+        .is_some_and(|value| value.len() != 1 || !matches!(value.as_bytes()[0], b'1'..=b'9'))
+    {
+        return Err(AppError::InvalidInput("标签快捷键只支持数字 1–9".into()));
+    }
+    if let Some(key) = shortcut_key {
+        let occupied = connection
+            .query_row(
+                "SELECT name FROM tag_tree WHERE shortcut_key=?1 AND id<>?2",
+                params![key, tag_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(name) = occupied {
+            return Err(AppError::InvalidInput(format!(
+                "快捷键 {key} 已绑定到“{name}”"
+            )));
+        }
+    }
+    let changed = connection.execute(
+        "UPDATE tag_tree SET shortcut_key=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2",
+        params![shortcut_key, tag_id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::NotFound(format!("标签 {tag_id}")));
+    }
+    Ok(())
+}
+
 pub fn set_photo_trashed(connection: &Connection, photo_id: i64, trashed: bool) -> AppResult<()> {
     let changed = connection.execute(
         "UPDATE photo_entries SET is_trashed=?1, updated_at=CURRENT_TIMESTAMP WHERE id=?2",
@@ -433,7 +484,7 @@ pub fn set_photo_trashed(connection: &Connection, photo_id: i64, trashed: bool) 
 
 pub fn list_tags(connection: &Connection) -> AppResult<Vec<TagNode>> {
     let mut statement = connection.prepare(
-        "SELECT t.id,t.parent_id,t.name,t.sort_order,COUNT(p.id)
+        "SELECT t.id,t.parent_id,t.name,t.sort_order,COUNT(p.id),t.shortcut_key
          FROM tag_tree t LEFT JOIN photo_entries p ON p.tag_id=t.id
          GROUP BY t.id ORDER BY t.parent_id, t.sort_order, t.name COLLATE NOCASE",
     )?;
@@ -444,6 +495,7 @@ pub fn list_tags(connection: &Connection) -> AppResult<Vec<TagNode>> {
             name: row.get(2)?,
             sort_order: row.get(3)?,
             photo_count: row.get(4)?,
+            shortcut_key: row.get(5)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
@@ -699,6 +751,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE project_settings(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL DEFAULT 1);
                  INSERT INTO project_settings(id) VALUES(1);
+                 CREATE TABLE tag_tree(id INTEGER PRIMARY KEY,name TEXT NOT NULL);
                  CREATE TABLE photo_entries(id INTEGER PRIMARY KEY);",
             )
             .unwrap();
@@ -714,12 +767,20 @@ mod tests {
         assert!(columns.contains("similarity_group"));
         assert!(columns.contains("is_similarity_hidden"));
         assert!(columns.contains("is_trashed"));
+        let tag_columns = connection
+            .prepare("PRAGMA table_info(tag_tree)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(tag_columns.contains("shortcut_key"));
         let version: i64 = connection
             .query_row("SELECT schema_version FROM project_settings", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -783,7 +844,7 @@ mod tests {
         connection.execute_batch(SCHEMA).unwrap();
         connection
             .execute(
-                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',4)",
+                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',5)",
                 [],
             )
             .unwrap();
@@ -814,7 +875,7 @@ mod tests {
         connection.execute_batch(SCHEMA).unwrap();
         connection
             .execute(
-                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',4)",
+                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',5)",
                 [],
             )
             .unwrap();
@@ -843,5 +904,28 @@ mod tests {
         assert_eq!(trash.len(), 1);
         assert!(trash[0].is_trashed);
         assert_eq!(trash[0].tag_id, Some(tag_id));
+    }
+
+    #[test]
+    fn tag_shortcuts_are_unique_and_can_be_unbound() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let first = create_tag(&connection, None, "风景").unwrap();
+        let second = create_tag(&connection, None, "人物").unwrap();
+
+        set_tag_shortcut(&connection, first, Some("1")).unwrap();
+        assert!(set_tag_shortcut(&connection, second, Some("1")).is_err());
+        assert!(set_tag_shortcut(&connection, second, Some("0")).is_err());
+        set_tag_shortcut(&connection, first, None).unwrap();
+        set_tag_shortcut(&connection, second, Some("1")).unwrap();
+
+        let shortcut: Option<String> = connection
+            .query_row(
+                "SELECT shortcut_key FROM tag_tree WHERE id=?1",
+                [second],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shortcut.as_deref(), Some("1"));
     }
 }

@@ -151,6 +151,16 @@ pub fn assign_tag(
 }
 
 #[tauri::command]
+pub fn set_tag_shortcut(
+    state: State<'_, AppState>,
+    tag_id: i64,
+    shortcut_key: Option<String>,
+) -> Result<(), String> {
+    let connection = db::connect(&state.project_path().command()?).command()?;
+    db::set_tag_shortcut(&connection, tag_id, shortcut_key.as_deref()).command()
+}
+
+#[tauri::command]
 pub fn set_photo_trashed(
     state: State<'_, AppState>,
     photo_id: i64,

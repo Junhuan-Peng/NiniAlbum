@@ -18,6 +18,7 @@ pub struct TagNode {
     pub name: String,
     pub sort_order: i64,
     pub photo_count: i64,
+    pub shortcut_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
