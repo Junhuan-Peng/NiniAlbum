@@ -599,7 +599,7 @@
   });
 </script>
 
-<svelte:window on:keydown|capture={handleKeydown} />
+<svelte:window on:keydown|capture={handleKeydown} on:contextmenu|preventDefault />
 
 <main class="flex h-full min-h-0 flex-col bg-background text-foreground">
   <header class="flex h-16 shrink-0 items-center gap-3 border-b border-border bg-[#15171a] px-4">
