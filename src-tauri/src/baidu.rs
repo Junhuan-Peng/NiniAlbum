@@ -1,10 +1,16 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
-    io::Read,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::Path,
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use keyring::Entry;
@@ -21,26 +27,31 @@ use crate::{
 };
 
 const SERVICE: &str = "com.nini-albums.baidu-netdisk";
-const CREDENTIAL_ACCOUNT: &str = "app-credentials";
-const TOKEN_ACCOUNT: &str = "oauth-token";
+const TOKEN_ACCOUNT: &str = "local-oauth-token-v1";
+const LEGACY_ACCOUNTS: [&str; 4] = [
+    "installation-token",
+    "access-token",
+    "app-credentials",
+    "oauth-token",
+];
 const APP_ROOT: &str = "/apps/尼尼相册";
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const OAUTH_CALLBACK: &str = "http://127.0.0.1:8787/oauth/baidu/callback";
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+static LOGIN_RUNNING: AtomicBool = AtomicBool::new(false);
+static LOGIN_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Credentials {
-    app_key: String,
-    secret_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TokenData {
+struct StoredToken {
     access_token: String,
     refresh_token: String,
     expires_at: u64,
+    user_name: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
+struct BaiduTokenResponse {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
@@ -79,119 +90,303 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn credentials() -> AppResult<Credentials> {
-    load_json(CREDENTIAL_ACCOUNT)?
-        .ok_or_else(|| invalid("请先在设置中填写百度网盘 AppKey 和 SecretKey"))
+fn embedded_value(name: &str, compiled: Option<&'static str>) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .or_else(|| compiled.map(str::to_owned))
+        .filter(|value| !value.trim().is_empty())
 }
 
-pub fn configure(app_key: String, secret_key: String) -> AppResult<()> {
-    let app_key = app_key.trim().to_owned();
-    let secret_key = secret_key.trim().to_owned();
-    if app_key.is_empty() || secret_key.is_empty() {
-        return Err(invalid("AppKey 和 SecretKey 不能为空"));
-    }
-    save_json(
-        CREDENTIAL_ACCOUNT,
-        &Credentials {
-            app_key,
-            secret_key,
-        },
+fn oauth_credentials() -> AppResult<(String, String)> {
+    let app_key = embedded_value("NINI_BAIDU_APP_KEY", option_env!("NINI_BAIDU_APP_KEY"))
+        .ok_or_else(|| invalid("当前构建未配置百度 AppKey"))?;
+    let secret_key = embedded_value(
+        "NINI_BAIDU_SECRET_KEY",
+        option_env!("NINI_BAIDU_SECRET_KEY"),
     )
+    .ok_or_else(|| invalid("当前构建未配置百度 SecretKey"))?;
+    Ok((app_key, secret_key))
 }
 
 pub fn status() -> AppResult<BaiduStatus> {
+    cleanup_legacy_credentials();
+    let token = load_json::<StoredToken>(TOKEN_ACCOUNT)?;
+    let error = LOGIN_ERROR.lock().ok().and_then(|error| error.clone());
     Ok(BaiduStatus {
-        configured: load_json::<Credentials>(CREDENTIAL_ACCOUNT)?.is_some(),
-        authorized: load_json::<TokenData>(TOKEN_ACCOUNT)?.is_some(),
+        configured: oauth_credentials().is_ok(),
+        authorized: token.is_some(),
+        user_name: token.map(|token| token.user_name),
+        error,
     })
 }
 
-pub fn authorization_url() -> AppResult<String> {
-    let config = credentials()?;
-    let mut url = reqwest::Url::parse("https://openapi.baidu.com/oauth/2.0/authorize")
-        .map_err(|error| invalid(error.to_string()))?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &config.app_key)
-        .append_pair("redirect_uri", "oob")
-        .append_pair("scope", "basic,netdisk")
-        .append_pair("display", "popup")
-        .append_pair("state", "nini_albums_export");
-    Ok(url.into())
+fn cleanup_legacy_credentials() {
+    for account in LEGACY_ACCOUNTS {
+        if let Ok(entry) = entry(account) {
+            let _ = entry.delete_credential();
+        }
+    }
 }
 
 pub fn open_authorization() -> AppResult<String> {
-    let url = authorization_url()?;
-    #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg(&url).status()?;
-    #[cfg(target_os = "windows")]
-    let status = Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .status()?;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let status = Command::new("xdg-open").arg(&url).status()?;
+    let (app_key, secret_key) = oauth_credentials()?;
+    LOGIN_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| invalid("百度网盘登录正在进行中"))?;
+    if let Ok(mut error) = LOGIN_ERROR.lock() {
+        *error = None;
+    }
+    let listener = TcpListener::bind("127.0.0.1:8787").map_err(|error| {
+        LOGIN_RUNNING.store(false, Ordering::SeqCst);
+        invalid(format!(
+            "无法启动登录回调服务，请确认 8787 端口未被占用：{error}"
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        LOGIN_RUNNING.store(false, Ordering::SeqCst);
+        AppError::Io(error)
+    })?;
+    let state = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut authorization_url =
+        reqwest::Url::parse("https://openapi.baidu.com/oauth/2.0/authorize")
+            .expect("Baidu authorization URL is valid");
+    authorization_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &app_key)
+        .append_pair("redirect_uri", OAUTH_CALLBACK)
+        .append_pair("scope", "basic,netdisk")
+        .append_pair("display", "popup")
+        .append_pair("state", &state);
+    let url = authorization_url.to_string();
+    let status = open_browser(&url).inspect_err(|_| {
+        LOGIN_RUNNING.store(false, Ordering::SeqCst);
+    })?;
     if !status.success() {
+        LOGIN_RUNNING.store(false, Ordering::SeqCst);
         return Err(invalid("无法打开系统浏览器，请复制授权链接后手动打开"));
     }
+    thread::spawn(move || {
+        if let Err(error) = wait_for_callback(listener, &state, &app_key, &secret_key) {
+            if let Ok(mut login_error) = LOGIN_ERROR.lock() {
+                *login_error = Some(error.to_string());
+            }
+        }
+        LOGIN_RUNNING.store(false, Ordering::SeqCst);
+    });
     Ok(url)
 }
 
-pub fn exchange_code(code: String) -> AppResult<()> {
-    let config = credentials()?;
-    let response = Client::new()
-        .get("https://openapi.baidu.com/oauth/2.0/token")
-        .query(&[
-            ("grant_type", "authorization_code"),
-            ("code", code.trim()),
-            ("client_id", config.app_key.as_str()),
-            ("client_secret", config.secret_key.as_str()),
-            ("redirect_uri", "oob"),
-        ])
-        .send()
-        .map_err(network_error)?;
-    let token: TokenResponse = response_json(response)?;
-    save_json(
-        TOKEN_ACCOUNT,
-        &TokenData {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token,
-            expires_at: now().saturating_add(token.expires_in),
-        },
-    )
-}
-
 pub fn disconnect() -> AppResult<()> {
+    if let Ok(mut error) = LOGIN_ERROR.lock() {
+        *error = None;
+    }
     match entry(TOKEN_ACCOUNT)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(invalid(format!("无法删除授权信息：{error}"))),
     }
 }
 
+fn open_browser(url: &str) -> AppResult<std::process::ExitStatus> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status()?;
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(url).status()?;
+    Ok(status)
+}
+
 fn access_token() -> AppResult<String> {
-    let mut token: TokenData = load_json(TOKEN_ACCOUNT)?
-        .ok_or_else(|| invalid("百度网盘尚未授权，请先在设置中完成授权"))?;
+    let mut token =
+        load_json::<StoredToken>(TOKEN_ACCOUNT)?.ok_or_else(|| invalid("请先登录百度网盘"))?;
     if token.expires_at > now().saturating_add(300) {
         return Ok(token.access_token);
     }
-    let config = credentials()?;
+    let (app_key, secret_key) = oauth_credentials()?;
     let response = Client::new()
         .get("https://openapi.baidu.com/oauth/2.0/token")
         .query(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", token.refresh_token.as_str()),
-            ("client_id", config.app_key.as_str()),
-            ("client_secret", config.secret_key.as_str()),
+            ("client_id", app_key.as_str()),
+            ("client_secret", secret_key.as_str()),
         ])
         .send()
         .map_err(network_error)?;
-    let refreshed: TokenResponse = response_json(response)?;
-    token = TokenData {
-        access_token: refreshed.access_token,
-        refresh_token: refreshed.refresh_token,
-        expires_at: now().saturating_add(refreshed.expires_in),
-    };
+    let refreshed: BaiduTokenResponse = oauth_response(response)?;
+    token.access_token = refreshed.access_token;
+    token.refresh_token = refreshed.refresh_token;
+    token.expires_at = now().saturating_add(refreshed.expires_in);
     save_json(TOKEN_ACCOUNT, &token)?;
     Ok(token.access_token)
+}
+
+fn wait_for_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    app_key: &str,
+    secret_key: &str,
+) -> AppResult<()> {
+    let started = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                return handle_callback(&mut stream, expected_state, app_key, secret_key);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= LOGIN_TIMEOUT {
+                    return Err(invalid("百度网盘登录等待超时"));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn handle_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+    app_key: &str,
+    secret_key: &str,
+) -> AppResult<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let mut buffer = [0_u8; 16 * 1024];
+    let read = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| invalid("登录回调请求格式无效"))?;
+    let callback_url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
+        .map_err(|error| invalid(format!("登录回调地址无效：{error}")))?;
+    if callback_url.path() != "/oauth/baidu/callback" {
+        write_callback_response(stream, false, "登录回调路径无效")?;
+        return Err(invalid("登录回调路径无效"));
+    }
+    let parameters: HashMap<_, _> = callback_url.query_pairs().into_owned().collect();
+    let result = complete_local_authorization(&parameters, expected_state, app_key, secret_key);
+    match &result {
+        Ok(user_name) => write_callback_response(stream, true, user_name)?,
+        Err(error) => write_callback_response(stream, false, &error.to_string())?,
+    }
+    result.map(|_| ())
+}
+
+fn complete_local_authorization(
+    parameters: &HashMap<String, String>,
+    expected_state: &str,
+    app_key: &str,
+    secret_key: &str,
+) -> AppResult<String> {
+    if let Some(error) = parameters.get("error") {
+        return Err(invalid(format!("百度拒绝授权：{error}")));
+    }
+    let state = parameters
+        .get("state")
+        .ok_or_else(|| invalid("登录回调缺少 state"))?;
+    if state != expected_state {
+        return Err(invalid("登录回调 state 校验失败"));
+    }
+    let code = parameters
+        .get("code")
+        .ok_or_else(|| invalid("登录回调缺少授权码"))?;
+    let response = Client::new()
+        .get("https://openapi.baidu.com/oauth/2.0/token")
+        .query(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", app_key),
+            ("client_secret", secret_key),
+            ("redirect_uri", OAUTH_CALLBACK),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let token: BaiduTokenResponse = oauth_response(response)?;
+    let user_name = fetch_user_name(&token.access_token)?;
+    save_json(
+        TOKEN_ACCOUNT,
+        &StoredToken {
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            expires_at: now().saturating_add(token.expires_in),
+            user_name: user_name.clone(),
+        },
+    )?;
+    Ok(user_name)
+}
+
+fn fetch_user_name(access_token: &str) -> AppResult<String> {
+    let response = Client::new()
+        .get("https://pan.baidu.com/rest/2.0/xpan/nas")
+        .query(&[("method", "uinfo"), ("access_token", access_token)])
+        .send()
+        .map_err(network_error)?;
+    let value: Value = response_json(response)?;
+    Ok(value
+        .get("netdisk_name")
+        .or_else(|| value.get("baidu_name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("百度网盘用户")
+        .to_owned())
+}
+
+fn oauth_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::blocking::Response,
+) -> AppResult<T> {
+    let status = response.status();
+    let bytes = response.bytes().map_err(network_error)?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("百度 OAuth 响应无法解析：{error}")))?;
+    if !status.is_success() || value.get("error").is_some() {
+        let message = value
+            .get("error_description")
+            .or_else(|| value.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("未知错误");
+        return Err(invalid(format!("百度 OAuth 返回错误：{message}")));
+    }
+    serde_json::from_value(value)
+        .map_err(|error| invalid(format!("百度 OAuth 响应字段不完整：{error}")))
+}
+
+fn write_callback_response(stream: &mut TcpStream, success: bool, message: &str) -> AppResult<()> {
+    let title = if success {
+        "登录成功"
+    } else {
+        "登录失败"
+    };
+    let color = if success { "#d9ff5b" } else { "#ff6b81" };
+    let body = format!(
+        "<!doctype html><meta charset=utf-8><title>{title}</title><style>body{{font:16px system-ui;background:#111;color:#eee;display:grid;place-items:center;height:100vh;margin:0}}main{{text-align:center}}h1{{color:{color}}}</style><main><h1>百度网盘{title}</h1><p>{}</p><p>现在可以关闭此窗口。</p></main>",
+        html_escape(message)
+    );
+    let status = if success { "200 OK" } else { "400 Bad Request" };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn network_error(error: reqwest::Error) -> AppError {
@@ -568,5 +763,17 @@ mod tests {
     fn renames_a_pair_with_one_suffix() {
         let result = renamed_file_names("DSC0001", &["a.JPG".into(), "a.ARW".into()], 2);
         assert_eq!(result, ["DSC0001_2.JPG", "DSC0001_2.ARW"]);
+    }
+
+    #[test]
+    fn rejects_a_callback_with_the_wrong_state_before_token_exchange() {
+        let parameters = HashMap::from([
+            ("state".into(), "unexpected".into()),
+            ("code".into(), "authorization-code".into()),
+        ]);
+        let result = complete_local_authorization(&parameters, "expected", "app", "secret");
+        assert!(
+            matches!(result, Err(AppError::InvalidInput(message)) if message.contains("state"))
+        );
     }
 }

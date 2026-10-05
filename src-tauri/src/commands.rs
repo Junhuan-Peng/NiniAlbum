@@ -259,20 +259,8 @@ pub fn baidu_status() -> Result<BaiduStatus, String> {
 }
 
 #[tauri::command]
-pub fn configure_baidu(app_key: String, secret_key: String) -> Result<(), String> {
-    baidu::configure(app_key, secret_key).command()
-}
-
-#[tauri::command]
 pub fn open_baidu_authorization() -> Result<String, String> {
     baidu::open_authorization().command()
-}
-
-#[tauri::command]
-pub async fn authorize_baidu(code: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || baidu::exchange_code(code).command())
-        .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

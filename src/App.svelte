@@ -37,10 +37,9 @@
   let exportDialog: { destination: 'local' | 'baidu'; root: string; plan: ExportPlan; strategy: 'skip' | 'overwrite' | 'rename' } | null = null;
   let baiduBrowser: BaiduDirectoryListing | null = null;
   let baiduNewFolder = '';
-  let baiduStatus: BaiduStatus = { configured: false, authorized: false };
-  let baiduAppKey = '';
-  let baiduSecretKey = '';
-  let baiduAuthorizationCode = '';
+  let baiduStatus: BaiduStatus = { configured: false, authorized: false, userName: null, error: null };
+  let baiduLoginPending = false;
+  let baiduLoginAttempt = 0;
   let existingProjectDialog: { databasePath: string; photoRoot: string } | null = null;
   let recentProjects: { path: string; name: string; photoRoot: string; lastOpened: number }[] = [];
   let smartKind: 'none' | 'date' | 'location' = 'none';
@@ -652,32 +651,35 @@
     });
   }
 
-  async function saveBaiduCredentials() {
-    if (!baiduAppKey.trim() || !baiduSecretKey.trim()) { toast('请输入 AppKey 和 SecretKey。'); return; }
-    try {
-      await api.configureBaidu(baiduAppKey, baiduSecretKey);
-      baiduSecretKey = '';
-      baiduStatus = await api.baiduStatus();
-      toast('百度网盘应用凭据已保存到系统凭据存储。', 'success');
-    } catch (error) { toast(errorMessage(error), 'error'); }
-  }
-
   async function startBaiduAuthorization() {
-    try { await api.openBaiduAuthorization(); toast('已在浏览器中打开百度授权页。'); }
-    catch (error) { toast(errorMessage(error), 'error'); }
-  }
-
-  async function finishBaiduAuthorization() {
-    if (!baiduAuthorizationCode.trim()) return;
+    const attempt = ++baiduLoginAttempt;
+    baiduLoginPending = true;
     try {
-      await api.authorizeBaidu(baiduAuthorizationCode);
-      baiduAuthorizationCode = '';
-      baiduStatus = await api.baiduStatus();
-      toast('百度网盘授权成功。', 'success');
+      await api.openBaiduAuthorization();
+      toast('已打开百度登录页面，正在等待授权…');
+      for (let index = 0; index < 150 && baiduLoginAttempt === attempt; index += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        try {
+          const status = await api.baiduStatus();
+          baiduStatus = status;
+          if (status.error) {
+            toast(`百度网盘登录失败：${status.error}`, 'error', 7000);
+            return;
+          }
+          if (status.authorized) {
+            toast(`百度网盘登录成功${status.userName ? `：${status.userName}` : ''}`, 'success');
+            return;
+          }
+        } catch { /* 本地回调尚未完成时继续等待。 */ }
+      }
+      if (baiduLoginAttempt === attempt) toast('登录等待超时，请重新点击登录。', 'error');
     } catch (error) { toast(errorMessage(error), 'error'); }
+    finally { if (baiduLoginAttempt === attempt) baiduLoginPending = false; }
   }
 
   async function disconnectBaidu() {
+    baiduLoginAttempt += 1;
+    baiduLoginPending = false;
     try { await api.disconnectBaidu(); baiduStatus = await api.baiduStatus(); toast('已移除百度网盘授权。'); }
     catch (error) { toast(errorMessage(error), 'error'); }
   }
@@ -925,7 +927,7 @@
 
 {#if deleteDialog}<Modal title="删除标签" description={`将删除“${deleteDialog.tag.name}”及其 ${deleteDialog.impact.tagCount - 1} 个子标签。`} on:close={() => deleteDialog = null}>{#if deleteDialog.impact.affectedPhotos > 0}<p class="rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm">标签子树正在被 <strong>{deleteDialog.impact.affectedPhotos}</strong> 张照片使用。请选择取消，或先将这些照片设为未标记再删除。</p>{:else}<p class="text-sm text-muted">该标签子树没有照片引用，可以安全删除。</p>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => deleteDialog = null}>不删除</Button><Button variant="danger" on:click={confirmDelete}>{deleteDialog.impact.affectedPhotos > 0 ? '取消标记并删除' : '确认删除'}</Button></div></Modal>{/if}
 
-{#if exportDestinationDialog}<Modal title="导出照片" description="选择导出位置；两种方式都要求使用空目录。" on:close={() => exportDestinationDialog = false}><div class="grid gap-3 sm:grid-cols-2"><button class="rounded-xl border border-border bg-white/5 p-4 text-left hover:border-accent/50" on:click={prepareLocalExport}><strong class="text-sm">导出到本地</strong><p class="mt-1 text-xs leading-5 text-muted">选择一个已存在的空目录，保留 JPEG/ARW 修改时间。</p></button><button class="rounded-xl border border-border bg-white/5 p-4 text-left hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-45" disabled={!baiduStatus.authorized} on:click={() => openBaiduBrowser()}><strong class="text-sm">导出到百度网盘</strong><p class="mt-1 text-xs leading-5 text-muted">在“我的应用数据/尼尼相册”中选择或新建空目录。</p></button></div>{#if !baiduStatus.authorized}<p class="mt-3 rounded-lg border border-border p-3 text-xs text-muted">百度网盘尚未授权，请先在设置中配置并授权。</p>{/if}</Modal>{/if}
+{#if exportDestinationDialog}<Modal title="导出照片" description="选择导出位置；两种方式都要求使用空目录。" on:close={() => exportDestinationDialog = false}><div class="grid gap-3 sm:grid-cols-2"><button class="rounded-xl border border-border bg-white/5 p-4 text-left hover:border-accent/50" on:click={prepareLocalExport}><strong class="text-sm">导出到本地</strong><p class="mt-1 text-xs leading-5 text-muted">选择一个已存在的空目录，保留 JPEG/ARW 修改时间。</p></button><button class="rounded-xl border border-border bg-white/5 p-4 text-left hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-45" disabled={!baiduStatus.authorized} on:click={() => openBaiduBrowser()}><strong class="text-sm">导出到百度网盘</strong><p class="mt-1 text-xs leading-5 text-muted">在“我的应用数据/尼尼相册”中选择或新建空目录。</p></button></div>{#if !baiduStatus.authorized}<p class="mt-3 rounded-lg border border-border p-3 text-xs text-muted">百度网盘尚未登录，请先在设置中完成登录授权。</p>{/if}</Modal>{/if}
 
 {#if baiduBrowser}<Modal title="选择百度网盘空目录" description={baiduBrowser.currentPath} on:close={() => baiduBrowser = null}><div class="mb-3 flex gap-2">{#if baiduParent(baiduBrowser.currentPath)}<Button size="sm" variant="ghost" on:click={openBaiduParent}>返回上级</Button>{/if}<Button size="sm" variant="primary" disabled={!baiduBrowser.isEmpty} on:click={selectBaiduExportRoot}>选择当前空目录</Button></div><div class="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-border p-2">{#each baiduBrowser.folders as folder}<button class="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-white/5" on:click={() => openBaiduBrowser(folder.path)}><span>▸</span><span class="truncate">{folder.name}</span></button>{:else}<p class="p-3 text-center text-xs text-muted">当前目录没有子目录</p>{/each}</div><div class="mt-4 flex gap-2"><input bind:value={baiduNewFolder} class="h-10 min-w-0 flex-1 rounded-md border border-border bg-[#101215] px-3 text-sm" placeholder="新建空目录名称" /><Button on:click={createBaiduExportFolder} disabled={!baiduNewFolder.trim()}>新建并选择</Button></div>{#if !baiduBrowser.isEmpty}<p class="mt-2 text-xs text-amber-300">当前目录不是空目录，不能作为导出根目录。</p>{/if}</Modal>{/if}
 
@@ -933,7 +935,7 @@
 
 {#if existingProjectDialog}<Modal title="项目文件已存在" description={existingProjectDialog.databasePath} on:close={() => existingProjectDialog = null}><div class="space-y-3 text-sm"><div class="rounded-lg border border-border bg-white/5 p-3"><strong class="block">打开并升级</strong><p class="mt-1 text-xs leading-5 text-muted">保留已有标签、扫描记录和项目设置，并自动升级数据库结构。</p></div><div class="rounded-lg border border-danger/30 bg-danger/10 p-3"><strong class="block text-danger">强制覆盖</strong><p class="mt-1 text-xs leading-5 text-muted">删除原项目数据库及其中的标签和索引，再创建空项目；照片目录中的原文件不会被删除。</p></div></div><div class="mt-5 flex flex-wrap justify-end gap-2"><Button variant="ghost" on:click={() => existingProjectDialog = null}>取消</Button><Button on:click={() => resolveExistingProject('upgrade')}>打开并升级</Button><Button variant="danger" on:click={() => resolveExistingProject('overwrite')}>强制覆盖</Button></div></Modal>{/if}
 
-{#if settingsDialog}<Modal title="设置" description="Nini Albums 软件设置" on:close={() => settingsDialog = false}><div class="max-h-[65vh] space-y-4 overflow-y-auto pr-1"><label class="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-border bg-white/5 p-3"><div><strong class="block text-sm">自动保存</strong><p class="mt-1 text-xs leading-5 text-muted">标签和隐藏状态始终即时入库。开启后还会定期将 SQLite WAL 完整合并到项目文件。</p></div><input type="checkbox" bind:checked={draftAutoSaveEnabled} class="mt-1 h-4 w-4 accent-[#d9ff5b]" /></label><label class="block"><span class="mb-1.5 block text-xs text-muted">自动保存间隔</span><select bind:value={draftAutoSaveIntervalMinutes} disabled={!draftAutoSaveEnabled} class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm disabled:opacity-45"><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={30}>每 30 分钟</option></select></label><div class="rounded-lg border border-border p-3 text-xs leading-5 text-muted"><div class="flex justify-between"><span>照片变更检测</span><span class="text-foreground">每 30 秒</span></div><p class="mt-1">只检查支持格式的路径、文件大小和修改时间；发现变化后会提示使用顶部刷新按钮。</p></div><section class="rounded-xl border border-border bg-white/[.03] p-3"><div class="flex items-center justify-between"><strong class="text-sm">百度网盘</strong><span class={baiduStatus.authorized ? 'text-xs text-accent' : 'text-xs text-muted'}>{baiduStatus.authorized ? '已授权' : baiduStatus.configured ? '待授权' : '未配置'}</span></div><p class="mt-1 text-xs leading-5 text-muted">应用凭据和 OAuth Token 只保存在操作系统凭据存储中，不写入项目数据库。</p><div class="mt-3 grid gap-2"><input bind:value={baiduAppKey} class="h-9 rounded border border-border bg-[#101215] px-3 text-xs" placeholder="AppKey" /><input bind:value={baiduSecretKey} type="password" class="h-9 rounded border border-border bg-[#101215] px-3 text-xs" placeholder="SecretKey（不会回显）" /><Button size="sm" on:click={saveBaiduCredentials}>保存应用凭据</Button></div>{#if baiduStatus.configured}<div class="mt-3 border-t border-border pt-3">{#if !baiduStatus.authorized}<Button size="sm" on:click={startBaiduAuthorization}>打开百度授权页</Button><div class="mt-2 flex gap-2"><input bind:value={baiduAuthorizationCode} class="h-9 min-w-0 flex-1 rounded border border-border bg-[#101215] px-3 text-xs" placeholder="粘贴授权码" /><Button size="sm" variant="primary" on:click={finishBaiduAuthorization}>完成授权</Button></div>{:else}<Button size="sm" variant="ghost" on:click={disconnectBaidu}>移除授权</Button>{/if}</div>{/if}</section></div><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => settingsDialog = false}>取消</Button><Button variant="primary" on:click={saveSettings}>保存设置</Button></div></Modal>{/if}
+{#if settingsDialog}<Modal title="设置" description="Nini Albums 软件设置" on:close={() => settingsDialog = false}><div class="max-h-[65vh] space-y-4 overflow-y-auto pr-1"><label class="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-border bg-white/5 p-3"><div><strong class="block text-sm">自动保存</strong><p class="mt-1 text-xs leading-5 text-muted">标签和隐藏状态始终即时入库。开启后还会定期将 SQLite WAL 完整合并到项目文件。</p></div><input type="checkbox" bind:checked={draftAutoSaveEnabled} class="mt-1 h-4 w-4 accent-[#d9ff5b]" /></label><label class="block"><span class="mb-1.5 block text-xs text-muted">自动保存间隔</span><select bind:value={draftAutoSaveIntervalMinutes} disabled={!draftAutoSaveEnabled} class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm disabled:opacity-45"><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={30}>每 30 分钟</option></select></label><div class="rounded-lg border border-border p-3 text-xs leading-5 text-muted"><div class="flex justify-between"><span>照片变更检测</span><span class="text-foreground">每 30 秒</span></div><p class="mt-1">只检查支持格式的路径、文件大小和修改时间；发现变化后会提示使用顶部刷新按钮。</p></div><section class="rounded-xl border border-border bg-white/[.03] p-3"><div class="flex items-center justify-between"><strong class="text-sm">百度网盘</strong><span class={baiduStatus.authorized ? 'text-xs text-accent' : 'text-xs text-muted'}>{baiduStatus.authorized ? '已登录' : baiduStatus.configured ? '未登录' : '未配置凭据'}</span></div><p class="mt-1 text-xs leading-5 text-muted">个人版使用应用内置凭据。登录时临时启动本机回调服务，Access Token 和 Refresh Token 仅保存在系统钥匙串中，照片由本机直接上传。</p>{#if !baiduStatus.authorized}<p class="mt-2 text-[10px] leading-5 text-muted">百度开放平台回调地址需设置为 http://127.0.0.1:8787/oauth/baidu/callback</p>{/if}{#if baiduStatus.error}<p class="mt-2 rounded-lg border border-danger/30 bg-danger/10 p-2 text-xs text-danger">{baiduStatus.error}</p>{/if}{#if baiduStatus.authorized}<div class="mt-3 rounded-lg border border-accent/20 bg-accent/5 p-3 text-xs"><span class="text-muted">当前账号</span><strong class="ml-2">{baiduStatus.userName ?? '百度网盘用户'}</strong></div><div class="mt-3"><Button size="sm" variant="ghost" on:click={disconnectBaidu}>退出百度网盘</Button></div>{:else}<div class="mt-3"><Button size="sm" variant="primary" disabled={baiduLoginPending || !baiduStatus.configured} on:click={startBaiduAuthorization}>{baiduLoginPending ? '等待浏览器授权…' : '登录百度网盘'}</Button></div>{/if}</section></div><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => settingsDialog = false}>取消</Button><Button variant="primary" on:click={saveSettings}>保存设置</Button></div></Modal>{/if}
 
 <ToastViewport />
 

@@ -174,6 +174,8 @@ pub struct ExportSummary {
 pub struct BaiduStatus {
     pub configured: bool,
     pub authorized: bool,
+    pub user_name: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -75,7 +75,7 @@ export interface ExportSummary {
   skippedIncomplete: number; skippedMissing: number; skippedHidden: number; skippedTrashed: number;
   failures: ExportFailure[];
 }
-export interface BaiduStatus { configured: boolean; authorized: boolean; }
+export interface BaiduStatus { configured: boolean; authorized: boolean; userName: string | null; error: string | null; }
 export interface BaiduFolder { name: string; path: string; }
 export interface BaiduDirectoryListing { currentPath: string; isEmpty: boolean; folders: BaiduFolder[]; }
 export interface ExportProgress { destination: 'baidu'; completedFiles: number; totalFiles: number; currentFile: string; }

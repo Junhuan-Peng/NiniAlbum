@@ -33,9 +33,7 @@ export const api = {
   exportPhotos: (exportRoot: string, strategy: string) =>
     invoke<ExportSummary>('export_photos', { exportRoot, strategy }),
   baiduStatus: () => invoke<BaiduStatus>('baidu_status'),
-  configureBaidu: (appKey: string, secretKey: string) => invoke<void>('configure_baidu', { appKey, secretKey }),
   openBaiduAuthorization: () => invoke<string>('open_baidu_authorization'),
-  authorizeBaidu: (code: string) => invoke<void>('authorize_baidu', { code }),
   disconnectBaidu: () => invoke<void>('disconnect_baidu'),
   listBaiduFolders: (directory?: string) => invoke<BaiduDirectoryListing>('list_baidu_folders', { directory }),
   createBaiduFolder: (parent: string, name: string) => invoke<string>('create_baidu_folder', { parent, name }),
