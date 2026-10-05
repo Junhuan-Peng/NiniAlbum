@@ -27,6 +27,19 @@ pub fn create_project(
 }
 
 #[tauri::command]
+pub fn replace_project(
+    state: State<'_, AppState>,
+    database_path: String,
+    photo_root: String,
+) -> Result<ProjectInfo, String> {
+    let database_path = PathBuf::from(database_path);
+    db::replace_project(&database_path, &PathBuf::from(photo_root)).command()?;
+    let info = db::open_project(&database_path).command()?;
+    state.set_project(database_path);
+    Ok(info)
+}
+
+#[tauri::command]
 pub fn open_project(
     state: State<'_, AppState>,
     database_path: String,

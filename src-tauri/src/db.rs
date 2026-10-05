@@ -200,6 +200,37 @@ pub fn create_project(database_path: &Path, photo_root: &Path) -> AppResult<()> 
     Ok(())
 }
 
+fn remove_sqlite_files(database_path: &Path) -> AppResult<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = database_path.as_os_str().to_owned();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn replace_project(database_path: &Path, photo_root: &Path) -> AppResult<()> {
+    if !photo_root.is_dir() {
+        return Err(AppError::InvalidPhotoRoot(photo_root.to_path_buf()));
+    }
+    if database_path.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "项目数据库路径是目录：{}",
+            database_path.display()
+        )));
+    }
+    if database_path.is_file() {
+        if let Ok(connection) = connect(database_path) {
+            let _ = checkpoint(&connection);
+        }
+    }
+    remove_sqlite_files(database_path)?;
+    create_project(database_path, photo_root)
+}
+
 pub fn open_project(database_path: &Path) -> AppResult<ProjectInfo> {
     if !database_path.is_file() {
         return Err(AppError::NotFound(database_path.display().to_string()));
@@ -575,5 +606,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn replacing_a_project_removes_old_data_but_not_photos() {
+        let workspace = tempfile::tempdir().unwrap();
+        let photos = workspace.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        let database = workspace.path().join("project.sqlite");
+        create_project(&database, &photos).unwrap();
+        let connection = connect(&database).unwrap();
+        create_tag(&connection, None, "旧标签").unwrap();
+        drop(connection);
+
+        replace_project(&database, &photos).unwrap();
+
+        let connection = connect(&database).unwrap();
+        let tags: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tag_tree", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tags, 0);
+        assert!(photos.is_dir());
     }
 }
