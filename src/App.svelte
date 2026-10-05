@@ -63,7 +63,7 @@
   $: classifiedPhotos = smartKind === 'none'
     ? sourcePhotos
     : sourcePhotos.filter((photo) => smartGroup ? smartValue(photo, smartKind) === smartGroup : Boolean(smartValue(photo, smartKind)));
-  $: photos = classifiedPhotos.filter((photo) => !photo.isSimilarityHidden);
+  $: photos = filter === 'trash' ? classifiedPhotos : classifiedPhotos.filter((photo) => !photo.isSimilarityHidden);
   $: currentPhoto = similarPhotos.find((photo) => photo.id === selectedPhotoId)
     ?? sourcePhotos.find((photo) => photo.id === selectedPhotoId)
     ?? photos[selectedIndex]
@@ -420,9 +420,28 @@
   async function submitTag() {
     if (!tagDialog || !tagName.trim()) return;
     try {
-      if (tagDialog === 'rename' && selectedTag) await api.renameTag(selectedTag.id, tagName);
-      else await api.createTag(tagName, tagDialog === 'child' ? selectedTagId : null);
-      tagDialog = null; await refresh(); toast('标签已保存。', 'success');
+      const mode = tagDialog;
+      if (mode === 'rename' && selectedTag) await api.renameTag(selectedTag.id, tagName);
+      else await api.createTag(tagName, mode === 'child' ? selectedTagId : null);
+      tagDialog = null;
+      await refresh();
+      if (mode === 'rename') toast('标签已重命名。', 'success');
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function toggleTrashView() {
+    filter = filter === 'trash' ? 'all' : 'trash';
+    smartKind = 'none'; smartGroup = ''; selectedIndex = 0;
+    await runBusy(filter === 'trash' ? '正在打开回收站…' : '正在返回照片列表…', async () => refresh(null));
+  }
+
+  async function toggleCurrentTrashed() {
+    if (!currentPhoto) return;
+    const photo = currentPhoto;
+    const nextId = photos[selectedIndex + 1]?.id ?? photos[selectedIndex - 1]?.id ?? null;
+    try {
+      await api.setPhotoTrashed(photo.id, !photo.isTrashed);
+      await refresh(nextId);
     } catch (error) { toast(errorMessage(error), 'error'); }
   }
 
@@ -441,6 +460,7 @@
 
   async function updateQuery() {
     if (!snapshot) return;
+    if (filter === 'trash') { smartKind = 'none'; smartGroup = ''; }
     await runBusy('正在更新列表…', async () => { await api.saveSort(sortField, sortDirection); await refresh(); });
   }
 
@@ -474,6 +494,7 @@
     if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
     if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
     if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
+    if (currentPhoto && (event.key === 'Delete' || event.key === 'Backspace')) { event.preventDefault(); toggleCurrentTrashed(); return; }
     if (event.key === 'ArrowDown') { event.preventDefault(); choosePhoto(Math.min(selectedIndex + 1, photos.length - 1)); }
     if (event.key === 'ArrowUp') { event.preventDefault(); choosePhoto(Math.max(selectedIndex - 1, 0)); }
     if (event.code === 'Space' && selectedTagId !== null) { event.preventDefault(); assignSelectedTag(selectedTagId, true); }
@@ -587,6 +608,7 @@
       <div class="ml-1 h-6 w-px bg-border"></div>
       <button class="relative grid h-9 w-9 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-accent/40 hover:text-foreground disabled:opacity-40" disabled={busy} on:click={scanPhotos} aria-label="刷新照片目录" title={sourceChanged ? '检测到文件变化，点击刷新' : '刷新照片目录'}><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M20 11a8 8 0 0 0-14.9-4M4 4v5h5M4 13a8 8 0 0 0 14.9 4M20 20v-5h-5" /></svg>{#if sourceChanged}<span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#15171a] bg-amber-400"></span>{/if}</button>
       <button class="grid h-9 w-9 place-items-center rounded-lg border border-border bg-accent text-black hover:bg-[#e5ff83] disabled:opacity-40" disabled={busy} on:click={prepareExport} aria-label="批量导出" title="批量导出"><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M12 3v12m0-12 4 4m-4-4L8 7M5 14v6h14v-6" /></svg></button>
+      <button class:border-danger={filter === 'trash'} class:text-danger={filter === 'trash'} class="relative grid h-9 w-9 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-danger/60 hover:text-danger disabled:opacity-40" disabled={busy} on:click={toggleTrashView} aria-label={filter === 'trash' ? '返回照片列表' : '打开回收站'} title={filter === 'trash' ? '返回照片列表' : `回收站（${snapshot.counts.trashed}）`}><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" /></svg>{#if snapshot.counts.trashed > 0}<span class="absolute -right-1 -top-1 min-w-4 rounded-full bg-danger px-1 text-[8px] font-bold leading-4 text-white">{snapshot.counts.trashed}</span>{/if}</button>
     {/if}
     <button class="ml-auto grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-[#444952] hover:text-foreground" on:click={openSettings} aria-label="设置" title="设置"><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
     <div class="flex shrink-0 items-center gap-2 text-xs text-muted">{#if busy}<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-r-transparent"></span><span class="max-w-48 truncate">{busyLabel}</span>{/if}</div>
@@ -609,7 +631,7 @@
     <section class="grid min-h-0 flex-1" style={`grid-template-columns:${leftWidth}px 5px minmax(0,1fr) 5px ${rightWidth}px`}>
       <aside class="flex min-h-0 flex-col border-r border-border bg-panel">
         <div class="space-y-2 border-b border-border p-2">
-          <select bind:value={filter} on:change={updateQuery} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="all">全部照片</option><option value="tagged">已标记</option><option value="untagged">未标记</option><option value="complete">配对完整</option><option value="incomplete">配对缺失</option><option value="conflict">配对冲突</option><option value="missing">文件丢失</option></select>
+          <select bind:value={filter} on:change={updateQuery} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="all">全部照片</option><option value="tagged">已标记</option><option value="untagged">未标记</option><option value="complete">配对完整</option><option value="incomplete">配对缺失</option><option value="conflict">配对冲突</option><option value="missing">文件丢失</option><option value="trash">回收站</option></select>
           <div class="flex gap-1"><select bind:value={sortField} on:change={updateQuery} class="h-8 min-w-0 flex-1 rounded border border-border bg-[#111316] px-2 text-xs"><option value="file_name">文件名</option><option value="relative_path">相对路径</option><option value="modified_time">修改时间</option><option value="tagged_status">标注状态</option><option value="missing_status">缺失状态</option></select><button class="h-8 w-9 rounded border border-border bg-[#111316] text-xs" on:click={() => { sortDirection = sortDirection === 'asc' ? 'desc' : 'asc'; updateQuery(); }} aria-label="切换排序方向">{sortDirection === 'asc' ? '↑' : '↓'}</button></div>
           <div class="rounded-lg border border-border bg-black/10 p-1.5"><label class="mb-1 block px-0.5 text-[9px] font-semibold uppercase tracking-widest text-muted" for="smart-kind">智能分类</label><select id="smart-kind" bind:value={smartKind} on:change={changeSmartKind} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="none">不筛选</option><option value="date">拍摄日期</option><option value="location">地理坐标</option></select>{#if smartKind !== 'none'}<select bind:value={smartGroup} on:change={changeSmartGroup} class="mt-1 h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="">全部有数据的照片</option>{#each smartOptions as option}<option value={option}>{option}</option>{/each}</select>{#if smartOptions.length === 0}<p class="px-1 pt-1.5 text-[10px] text-muted">暂无数据，请重新扫描照片。</p>{/if}{/if}</div>
         </div>
@@ -617,7 +639,7 @@
           {#each photos as photo, index (photo.id)}
             <button class:active={photo.id === currentPhoto?.id} class="mb-1 flex min-h-[88px] w-full items-center gap-3 rounded-lg border border-transparent p-2 text-left hover:bg-white/5" on:click={() => choosePhoto(index)}>
               <div class="grid shrink-0 place-items-center overflow-hidden rounded-md bg-[#0d0e10] text-[10px] text-muted shadow-sm" style={thumbnailStyle(photo)}>{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt="" class="h-full w-full object-cover" />{:else}{photo.isMissing ? '丢失' : photo.pairStatus === 'conflict' ? '冲突' : 'RAW'}{/if}</div>
-              <div class="min-w-0 flex-1 py-0.5"><div class="truncate text-xs font-medium">{photo.displayBaseName}</div><div class="mt-1 truncate text-[10px] text-muted">{photo.relativeDir || '根目录'}</div><div class="mt-1 flex items-center gap-1 text-[9px]">{#if photo.isMissing}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">丢失</span>{:else if photo.pairStatus === 'conflict'}<span class="rounded bg-amber-400/15 px-1.5 py-0.5 text-amber-300">冲突</span>{:else if photo.pairStatus !== 'complete'}<span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-sky-300">缺配对</span>{/if}{#if photo.tagId}<span class="truncate rounded bg-accent/10 px-1.5 py-0.5 text-accent">{photo.tagPath}</span>{/if}</div></div>
+              <div class="min-w-0 flex-1 py-0.5"><div class="truncate text-xs font-medium">{photo.displayBaseName}</div><div class="mt-1 truncate text-[10px] text-muted">{photo.relativeDir || '根目录'}</div><div class="mt-1 flex items-center gap-1 text-[9px]">{#if photo.isTrashed}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">待删除</span>{:else if photo.isMissing}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">丢失</span>{:else if photo.pairStatus === 'conflict'}<span class="rounded bg-amber-400/15 px-1.5 py-0.5 text-amber-300">冲突</span>{:else if photo.pairStatus !== 'complete'}<span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-sky-300">缺配对</span>{/if}{#if photo.tagId}<span class="truncate rounded bg-accent/10 px-1.5 py-0.5 text-accent">{photo.tagPath}</span>{/if}</div></div>
             </button>
           {:else}<div class="p-5 text-center text-xs text-muted">当前筛选没有照片</div>{/each}
         </div>
@@ -648,7 +670,7 @@
       </section>
       <button class="cursor-col-resize bg-transparent hover:bg-accent/40" on:pointerdown={(event) => resize('right', event)} aria-label="调整标签面板宽度"></button>
       <aside class="flex min-h-0 flex-col border-l border-border bg-panel">
-        <div class="border-b border-border p-3"><div class="text-[10px] font-semibold uppercase tracking-[.18em] text-muted">当前照片标签</div><div class="mt-1 min-h-5 truncate text-sm text-accent">{currentPhoto?.tagPath ?? '未标记'}</div></div>
+        <div class="border-b border-border p-3"><div class="flex items-center justify-between gap-2"><div class="text-[10px] font-semibold uppercase tracking-[.18em] text-muted">当前照片标签</div>{#if currentPhoto}<button class="rounded border border-border px-2 py-1 text-[9px] text-muted hover:border-danger/60 hover:text-danger" on:click={toggleCurrentTrashed} title="快捷键：Delete">{currentPhoto.isTrashed ? '恢复照片' : '标记删除'}</button>{/if}</div><div class="mt-1 flex min-h-5 items-center gap-2 truncate text-sm text-accent"><span class="truncate">{currentPhoto?.tagPath ?? '未标记'}</span>{#if currentPhoto?.isTrashed}<span class="shrink-0 rounded bg-danger/15 px-1.5 py-0.5 text-[9px] text-danger">回收站</span>{/if}</div></div>
         <details class="group border-b border-border" open>
           <summary class="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-[10px] font-semibold uppercase tracking-[.18em] text-muted"><span>EXIF 信息</span><span class="transition-transform group-open:rotate-180">⌄</span></summary>
           {#if currentPhoto}
@@ -671,13 +693,13 @@
         <div class="border-t border-border p-3 text-[10px] leading-5 text-muted">单击立即分配 · 空格重复分配并前进<br />↑ ↓ 切换照片 · ⌘/Ctrl+S 同步</div>
       </aside>
     </section>
-    <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{currentListIndex >= 0 ? currentListIndex + 1 : '组内'} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span>{#if hiddenSimilarityCount}<span>相似图隐藏 {hiddenSimilarityCount}</span>{/if}<span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span><span class="ml-auto max-w-[35%] truncate">{snapshot.project.photoRoot}</span></footer>
+    <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{currentListIndex >= 0 ? currentListIndex + 1 : '组内'} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span>{#if hiddenSimilarityCount}<span>相似图隐藏 {hiddenSimilarityCount}</span>{/if}<span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span>{#if snapshot.counts.trashed}<span class="text-danger">回收站 {snapshot.counts.trashed}</span>{/if}<span class="ml-auto max-w-[35%] truncate">{snapshot.project.photoRoot}</span></footer>
   {:else}
     <section class="min-h-0 flex-1 overflow-y-auto bg-[radial-gradient(circle_at_top,#20242a_0,#101113_58%)] p-8"><div class="mx-auto flex min-h-full max-w-3xl flex-col justify-center py-8"><div class="text-center"><div class="mx-auto grid h-20 w-20 place-items-center rounded-3xl border border-accent/30 bg-accent/10 text-4xl font-black text-accent">N</div><h1 class="mt-7 text-3xl font-semibold">把照片，整理成你熟悉的样子</h1><p class="mt-3 leading-7 text-muted">在本地完成配对、归类与导出，原片始终留在原处。</p><div class="mt-7 flex justify-center gap-3"><Button variant="primary" on:click={createProject}>新建项目</Button><Button on:click={openProject}>打开已有项目</Button></div></div>{#if recentProjects.length}<div class="mt-12"><div class="mb-3 flex items-center justify-between"><h2 class="text-sm font-semibold">最近打开</h2><span class="text-[10px] text-muted">最多保留 6 个项目</span></div><div class="grid gap-2 sm:grid-cols-2">{#each recentProjects as recent}<button class="group rounded-xl border border-border bg-panel/80 p-3 text-left transition hover:border-accent/40 hover:bg-white/5" on:click={() => openRecentProject(recent.path)}><div class="flex items-center gap-3"><div class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/10 text-sm font-bold text-accent">N</div><div class="min-w-0"><div class="truncate text-sm font-medium group-hover:text-accent">{recent.name}</div><div class="mt-0.5 truncate text-[10px] text-muted">{recent.photoRoot}</div></div></div></button>{/each}</div></div>{/if}</div></section>
   {/if}
 </main>
 
-{#if tagDialog}<Modal title={tagDialog === 'root' ? '新建根标签' : tagDialog === 'child' ? '新建子标签' : '重命名标签'} on:close={() => tagDialog = null}><form on:submit|preventDefault={submitTag}><label class="mb-1.5 block text-xs text-muted" for="tag-name">标签名称</label><input id="tag-name" bind:value={tagName} use:focusOnMount class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm outline-none focus:border-accent" placeholder="例如：风景" /><p class="mt-2 text-[11px] text-muted">同级名称必须唯一，不能包含跨平台文件名非法字符。</p><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => tagDialog = null}>取消</Button><Button type="submit" variant="primary">保存</Button></div></form></Modal>{/if}
+{#if tagDialog}<Modal title={tagDialog === 'root' ? '新建根标签' : tagDialog === 'child' ? '新建子标签' : '重命名标签'} on:close={() => tagDialog = null}><form on:submit|preventDefault={submitTag}><label class="mb-1.5 block text-xs text-muted" for="tag-name">{tagDialog === 'rename' ? '标签名称' : '标签名称或路径'}</label><input id="tag-name" bind:value={tagName} use:focusOnMount class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm outline-none focus:border-accent" placeholder={tagDialog === 'rename' ? '例如：风景' : '例如：青海/沿途'} /><p class="mt-2 text-[11px] text-muted">{tagDialog === 'rename' ? '同级名称必须唯一，不能包含跨平台文件名非法字符。' : '使用 / 可一次创建多级标签；已有中间层会自动复用。'}</p><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => tagDialog = null}>取消</Button><Button type="submit" variant="primary">保存</Button></div></form></Modal>{/if}
 
 {#if deleteDialog}<Modal title="删除标签" description={`将删除“${deleteDialog.tag.name}”及其 ${deleteDialog.impact.tagCount - 1} 个子标签。`} on:close={() => deleteDialog = null}>{#if deleteDialog.impact.affectedPhotos > 0}<p class="rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm">标签子树正在被 <strong>{deleteDialog.impact.affectedPhotos}</strong> 张照片使用。请选择取消，或先将这些照片设为未标记再删除。</p>{:else}<p class="text-sm text-muted">该标签子树没有照片引用，可以安全删除。</p>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => deleteDialog = null}>不删除</Button><Button variant="danger" on:click={confirmDelete}>{deleteDialog.impact.affectedPhotos > 0 ? '取消标记并删除' : '确认删除'}</Button></div></Modal>{/if}
 

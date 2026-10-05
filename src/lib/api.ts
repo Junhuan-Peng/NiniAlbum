@@ -20,6 +20,7 @@ export const api = {
   deleteImpact: (id: number) => invoke<DeleteImpact>('inspect_tag_delete', { id }),
   deleteTag: (id: number, unassign: boolean) => invoke<void>('delete_tag', { id, unassign }),
   assignTag: (photoId: number, tagId: number | null) => invoke<void>('assign_tag', { photoId, tagId }),
+  setPhotoTrashed: (photoId: number, trashed: boolean) => invoke<void>('set_photo_trashed', { photoId, trashed }),
   saveSort: (field: string, direction: string) => invoke<void>('save_sort', { field, direction }),
   deleteMissing: (ids: number[]) => invoke<number>('delete_missing', { ids }),
   checkpoint: () => invoke<void>('checkpoint'),

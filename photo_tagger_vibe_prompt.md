@@ -64,6 +64,7 @@
 - 一张照片组只能绑定一个标签节点；`NULL` 表示未标记；
 - 父节点与叶子节点均可绑定照片；
 - 同一父节点下的标签名称大小写不敏感且必须唯一；根节点之间同样唯一；
+- 新建标签时支持用 `/` 分隔并在单个事务中创建多级路径；已有中间层自动复用，空层级和末级重名拒绝保存；
 - 单击标签立即分配给当前照片组；
 - 按空格将当前选中的标签再次分配给当前照片组，然后自动跳到下一张；
 - 修改标签名称只更新标签表，不批量改写照片记录；
@@ -74,7 +75,7 @@
 ### 3.4 标签名与导出目录安全
 
 - 创建或重命名标签时禁止空名称和纯空白名称；
-- 校验 Windows/macOS 不安全字符，包括 `< > : " / \ | ? *`、控制字符、尾部空格和尾部句点；
+- 单个标签名称校验 Windows/macOS 不安全字符，包括 `< > : " \ | ? *`、控制字符、尾部空格和尾部句点；`/` 仅在新建流程中作为层级分隔符；
 - Windows 保留名称（如 `CON`、`PRN`、`AUX`、`NUL`、`COM1`、`LPT1`）不得直接作为标签目录名；
 - UI 优先阻止保存非法名称；导出层仍需二次校验并使用确定性的安全替换规则；
 - 标签完整路径通过递归 CTE 动态查询，例如 `风景 > 青海 > 茶卡盐湖`。
@@ -102,7 +103,7 @@ CREATE TABLE project_settings (
     )),
   sort_direction TEXT NOT NULL DEFAULT 'asc'
     CHECK (sort_direction IN ('asc', 'desc')),
-  schema_version INTEGER NOT NULL DEFAULT 3,
+  schema_version INTEGER NOT NULL DEFAULT 4,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -188,6 +189,8 @@ CREATE TABLE photo_entries (
   similarity_group TEXT NULL,
   is_similarity_hidden INTEGER NOT NULL DEFAULT 0
     CHECK (is_similarity_hidden IN (0, 1)),
+  is_trashed INTEGER NOT NULL DEFAULT 0
+    CHECK (is_trashed IN (0, 1)),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(relative_dir, pairing_key)
@@ -196,6 +199,7 @@ CREATE TABLE photo_entries (
 CREATE INDEX idx_photo_tag_id ON photo_entries(tag_id);
 CREATE INDEX idx_photo_pair_status ON photo_entries(pair_status);
 CREATE INDEX idx_photo_missing ON photo_entries(is_missing);
+CREATE INDEX idx_photo_trashed ON photo_entries(is_trashed);
 CREATE INDEX idx_photo_sort_name ON photo_entries(display_base_name);
 CREATE INDEX idx_photo_sort_path ON photo_entries(relative_dir);
 ```
@@ -209,6 +213,7 @@ CREATE INDEX idx_photo_sort_path ON photo_entries(relative_dir);
 - `perceptual_hash` 用于在拍摄时间相差 10 分钟内识别高度相似照片，命中后写入稳定的 `similarity_group`；
 - 相似组是照片浏览的固有上下文，不属于智能筛选项；选择组内照片时在预览区右侧显示完整组；
 - 用户可将组内照片从主列表隐藏，状态写入 `is_similarity_hidden`。隐藏照片仍可在相似组侧栏查看和恢复，并且每组至少保留一个未隐藏成员作为入口；
+- `is_trashed` 是独立于 `tag_id` 的内置待删除状态；移入回收站时保留原标签，恢复后回到原标签，且绝不删除源文件；
 - 配对状态与丢失状态相互独立，例如历史上完整配对的照片组移动失败后可以是 `complete + is_missing=1`。
 
 ### 4.5 `photo_files`：照片组内的实际文件
@@ -309,12 +314,12 @@ SELECT path FROM tag_path WHERE id = ?1;
 
 第一版支持以下排序字段及升序/降序：文件名、相对路径、修改时间、标注状态、缺失状态。排序设置保存到 `project_settings`，修改时间排序使用照片组内现存文件的最新修改时间。
 
-至少支持以下筛选：全部、已标记、未标记、配对完整、配对缺失、配对冲突、文件丢失。
+至少支持以下筛选：全部、已标记、未标记、配对完整、配对缺失、配对冲突、文件丢失、回收站。除回收站外的筛选默认排除 `is_trashed=1`。
 
 ## 8. 批量导出
 
 1. 用户选择导出根目录；
-2. 只处理 `tag_id IS NOT NULL`、配对完整且文件实际存在的照片组；
+2. 只处理 `tag_id IS NOT NULL`、`is_trashed=0`、配对完整且文件实际存在的照片组；
 3. 未配对、冲突或丢失记录跳过，并分别统计；
 4. 使用递归 CTE 获取标签完整路径并创建层级目录；
 5. 同时复制 JPEG 与 ARW，不移动、转码或重写文件内容；
@@ -350,6 +355,7 @@ SELECT path FROM tag_path WHERE id = ?1;
 
 - `↑` / `↓`：上一张或下一张照片组；
 - `Space`：重复分配当前选中标签并跳到下一张；
+- `Delete` / macOS `Backspace`：将当前照片移入回收站；在回收站中再次按下则恢复；
 - 设置对话框集中管理软件设置，包括自动保存开关和保存间隔；
 - 输入框、弹窗或可编辑控件获得焦点时，不触发照片快捷键。
 

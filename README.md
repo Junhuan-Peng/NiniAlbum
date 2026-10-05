@@ -35,6 +35,7 @@ npm run tauri build
 - 照片路径以相对于根目录的形式存储，移动根目录后可重新定位。
 - SQLite 启用外键和 WAL，标签及扫描操作即时持久化。
 - 缩略图写入数据库；ARW 不解码、不生成预览。
+- 标签名称可用 `/` 一次创建多级路径；照片可软标记为待删除并在回收站恢复，源文件不会被删除。
 - 数据库结构版本存放在 `project_settings.schema_version`。后续结构变更应增加版本并执行向前迁移，不能删除旧数据库。
 
 完整产品和数据规则见 [photo_tagger_vibe_prompt.md](./photo_tagger_vibe_prompt.md)。

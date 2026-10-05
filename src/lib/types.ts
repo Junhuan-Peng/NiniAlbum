@@ -8,7 +8,7 @@ export interface ProjectInfo {
 
 export type SortField = 'file_name' | 'relative_path' | 'modified_time' | 'tagged_status' | 'missing_status';
 export type SortDirection = 'asc' | 'desc';
-export type PhotoFilter = 'all' | 'tagged' | 'untagged' | 'complete' | 'incomplete' | 'conflict' | 'missing';
+export type PhotoFilter = 'all' | 'tagged' | 'untagged' | 'complete' | 'incomplete' | 'conflict' | 'missing' | 'trash';
 
 export interface TagNode {
   id: number;
@@ -47,9 +47,10 @@ export interface PhotoEntry {
   locationGroup: string | null;
   similarityGroup: string | null;
   isSimilarityHidden: boolean;
+  isTrashed: boolean;
 }
 
-export interface ProjectCounts { total: number; tagged: number; missing: number; conflicts: number; incomplete: number; }
+export interface ProjectCounts { total: number; tagged: number; missing: number; conflicts: number; incomplete: number; trashed: number; }
 export interface ProjectSnapshot { project: ProjectInfo; tags: TagNode[]; photos: PhotoEntry[]; counts: ProjectCounts; }
 export interface PhotoQuery { filter?: PhotoFilter; sortField?: SortField; sortDirection?: SortDirection; }
 
