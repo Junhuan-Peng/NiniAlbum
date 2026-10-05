@@ -78,4 +78,16 @@ export interface ExportSummary {
 export interface BaiduStatus { configured: boolean; authorized: boolean; userName: string | null; error: string | null; }
 export interface BaiduFolder { name: string; path: string; }
 export interface BaiduDirectoryListing { currentPath: string; isEmpty: boolean; folders: BaiduFolder[]; }
-export interface ExportProgress { destination: 'baidu'; completedFiles: number; totalFiles: number; currentFile: string; }
+export type ExportTaskStatus = 'queued' | 'running' | 'paused' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+export interface ExportTask {
+  id: string;
+  destination: 'local' | 'baidu';
+  root: string;
+  status: ExportTaskStatus;
+  completedFiles: number;
+  totalFiles: number;
+  currentFile: string;
+  createdAt: number;
+  summary: ExportSummary | null;
+  error: string | null;
+}

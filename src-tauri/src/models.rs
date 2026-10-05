@@ -195,9 +195,15 @@ pub struct BaiduDirectoryListing {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExportProgress {
+pub struct ExportTask {
+    pub id: String,
     pub destination: String,
+    pub root: String,
+    pub status: String,
     pub completed_files: usize,
     pub total_files: usize,
     pub current_file: String,
+    pub created_at: u64,
+    pub summary: Option<ExportSummary>,
+    pub error: Option<String>,
 }

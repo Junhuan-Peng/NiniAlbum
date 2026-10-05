@@ -524,12 +524,16 @@ pub fn plan_export(database_path: &Path, root: &str) -> AppResult<ExportPlan> {
     export::content_plan(database_path)
 }
 
-fn split_file(path: &Path) -> AppResult<(u64, Vec<String>)> {
+fn split_file<C>(path: &Path, checkpoint: &mut C) -> AppResult<(u64, Vec<String>)>
+where
+    C: FnMut() -> AppResult<()>,
+{
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
     let mut hashes = Vec::new();
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     loop {
+        checkpoint()?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -542,9 +546,18 @@ fn split_file(path: &Path) -> AppResult<(u64, Vec<String>)> {
     Ok((size, hashes))
 }
 
-fn upload_file(token: &str, source: &Path, remote_path: &str, modified_time: f64) -> AppResult<()> {
+fn upload_file<C>(
+    token: &str,
+    source: &Path,
+    remote_path: &str,
+    modified_time: f64,
+    checkpoint: &mut C,
+) -> AppResult<()>
+where
+    C: FnMut() -> AppResult<()>,
+{
     let client = Client::new();
-    let (size, hashes) = split_file(source)?;
+    let (size, hashes) = split_file(source, checkpoint)?;
     let block_list = serde_json::to_string(&hashes).map_err(|error| invalid(error.to_string()))?;
     let response = client
         .post("https://pan.baidu.com/rest/2.0/xpan/file")
@@ -591,6 +604,7 @@ fn upload_file(token: &str, source: &Path, remote_path: &str, modified_time: f64
 
     let mut file = File::open(source)?;
     for part_index in 0..hashes.len() {
+        checkpoint()?;
         let mut chunk = vec![0_u8; CHUNK_SIZE];
         let read = file.read(&mut chunk)?;
         chunk.truncate(read);
@@ -621,6 +635,7 @@ fn upload_file(token: &str, source: &Path, remote_path: &str, modified_time: f64
         let _: Value = response_json(response)?;
     }
 
+    checkpoint()?;
     let timestamp = modified_time.max(0.0).trunc() as u64;
     let response = client
         .post("https://pan.baidu.com/rest/2.0/xpan/file")
@@ -655,14 +670,16 @@ fn renamed_file_names(display_name: &str, names: &[String; 2], index: usize) -> 
     })
 }
 
-pub fn export_photos<F>(
+pub fn export_photos<F, C>(
     database_path: &Path,
     root: &str,
     strategy: &str,
     mut progress: F,
+    mut checkpoint: C,
 ) -> AppResult<ExportSummary>
 where
     F: FnMut(usize, usize, &str),
+    C: FnMut() -> AppResult<()>,
 {
     validate_remote_path(root)?;
     let token = access_token()?;
@@ -681,8 +698,10 @@ where
     let mut directories = HashSet::from([root.to_owned()]);
     let mut occupied = HashSet::new();
     let mut completed_files = 0;
+    progress(0, total_files, "");
 
     for item in manifest {
+        checkpoint()?;
         let mut directory = root.trim_end_matches('/').to_owned();
         for component in &item.tag_components {
             directory.push('/');
@@ -698,6 +717,8 @@ where
         let conflict = original_keys.iter().any(|path| occupied.contains(path));
         if conflict && strategy == "skip" {
             summary.skipped += 1;
+            completed_files += 2;
+            progress(completed_files, total_files, "");
             continue;
         }
         let names = if conflict && strategy == "rename" {
@@ -722,16 +743,26 @@ where
                 .map(|name| format!("{directory}/{}", name.to_lowercase())),
         );
 
+        let item_start = completed_files;
         let mut item_failed = None;
         for (file, name) in item.files.iter().zip(names.iter()) {
+            checkpoint()?;
             progress(completed_files, total_files, name);
             let remote_path = format!("{directory}/{name}");
-            if let Err(error) = upload_file(&token, &file.source, &remote_path, file.modified_time)
-            {
-                item_failed = Some(error.to_string());
-                break;
+            match upload_file(
+                &token,
+                &file.source,
+                &remote_path,
+                file.modified_time,
+                &mut checkpoint,
+            ) {
+                Ok(()) => completed_files += 1,
+                Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+                Err(error) => {
+                    item_failed = Some(error.to_string());
+                    break;
+                }
             }
-            completed_files += 1;
         }
         if let Some(reason) = item_failed {
             summary.failed += 1;
@@ -743,6 +774,8 @@ where
         } else {
             summary.succeeded += 1;
         }
+        completed_files = (item_start + 2).min(total_files);
+        progress(completed_files, total_files, "");
     }
     progress(completed_files, total_files, "");
     Ok(summary)

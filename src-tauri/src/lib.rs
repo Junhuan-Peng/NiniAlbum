@@ -5,11 +5,13 @@ mod error;
 mod export;
 mod models;
 mod scan;
+mod tasks;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(db::AppState::default())
+        .manage(tasks::ExportTaskManager::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::create_project,
@@ -36,14 +38,19 @@ pub fn run() {
             commands::delete_missing,
             commands::checkpoint,
             commands::plan_export,
-            commands::export_photos,
+            commands::start_local_export,
             commands::baidu_status,
             commands::open_baidu_authorization,
             commands::disconnect_baidu,
             commands::list_baidu_folders,
             commands::create_baidu_folder,
             commands::plan_baidu_export,
-            commands::export_to_baidu,
+            commands::start_baidu_export,
+            commands::list_export_tasks,
+            commands::pause_export_task,
+            commands::resume_export_task,
+            commands::cancel_export_task,
+            commands::clear_finished_export_tasks,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Nini Albums");

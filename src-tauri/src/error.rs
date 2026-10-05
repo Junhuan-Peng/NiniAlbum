@@ -26,6 +26,8 @@ pub enum AppError {
     Image(#[from] image::ImageError),
     #[error("无效参数：{0}")]
     InvalidInput(String),
+    #[error("导出任务已取消")]
+    Cancelled,
 }
 
 pub type AppResult<T> = Result<T, AppError>;

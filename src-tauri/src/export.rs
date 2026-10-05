@@ -190,14 +190,34 @@ fn restore_mtime(path: &Path, seconds: f64) -> AppResult<()> {
     Ok(())
 }
 
-fn copy_pair(root: &Path, destination: &(PathBuf, PathBuf), item: &ExportItem) -> AppResult<()> {
+fn copy_pair_controlled<P, C>(
+    root: &Path,
+    destination: &(PathBuf, PathBuf),
+    item: &ExportItem,
+    completed: &mut usize,
+    total: usize,
+    progress: &mut P,
+    checkpoint: &mut C,
+) -> AppResult<()>
+where
+    P: FnMut(usize, usize, &str),
+    C: FnMut() -> AppResult<()>,
+{
     let jpeg_source = root.join(&item.jpeg.relative_path);
     let raw_source = root.join(&item.raw.relative_path);
+    checkpoint()?;
+    progress(*completed, total, &item.jpeg.original_name);
     fs::copy(&jpeg_source, &destination.0)?;
+    *completed += 1;
+    checkpoint().inspect_err(|_| {
+        let _ = fs::remove_file(&destination.0);
+    })?;
+    progress(*completed, total, &item.raw.original_name);
     if let Err(error) = fs::copy(&raw_source, &destination.1) {
         let _ = fs::remove_file(&destination.0);
         return Err(error.into());
     }
+    *completed += 1;
     restore_mtime(&destination.0, item.jpeg.modified_time)?;
     restore_mtime(&destination.1, item.raw.modified_time)?;
     Ok(())
@@ -404,11 +424,32 @@ pub fn plan_export(database_path: &Path, export_root: &Path) -> AppResult<Export
     Ok(plan)
 }
 
+#[cfg(test)]
 pub fn export_photos(
     database_path: &Path,
     export_root: &Path,
     strategy: &str,
 ) -> AppResult<ExportSummary> {
+    export_photos_controlled(
+        database_path,
+        export_root,
+        strategy,
+        |_, _, _| {},
+        || Ok(()),
+    )
+}
+
+pub fn export_photos_controlled<P, C>(
+    database_path: &Path,
+    export_root: &Path,
+    strategy: &str,
+    mut progress: P,
+    mut checkpoint: C,
+) -> AppResult<ExportSummary>
+where
+    P: FnMut(usize, usize, &str),
+    C: FnMut() -> AppResult<()>,
+{
     validate_empty_directory(export_root)?;
     let strategy = ConflictStrategy::parse(strategy)?;
     let connection = db::connect(database_path)?;
@@ -418,6 +459,9 @@ pub fn export_photos(
         |row| row.get(0),
     )?);
     let items = export_items(&connection)?;
+    let total_files = items.len() * 2;
+    let mut completed_files = 0;
+    progress(0, total_files, "");
     let counts = export_counts(&connection)?;
     let mut summary = ExportSummary {
         untagged: counts.untagged,
@@ -428,6 +472,7 @@ pub fn export_photos(
         ..Default::default()
     };
     for item in items {
+        checkpoint()?;
         let directory = target_directory(export_root, item.tag_path.as_deref());
         if let Err(error) = fs::create_dir_all(&directory) {
             summary.failed += 1;
@@ -436,12 +481,16 @@ pub fn export_photos(
                 name: item.base_name.clone(),
                 reason: error.to_string(),
             });
+            completed_files += 2;
+            progress(completed_files, total_files, "");
             continue;
         }
         let original = original_targets(&directory, &item);
         let conflict = has_conflict(&original);
         if conflict && strategy == ConflictStrategy::Skip {
             summary.skipped += 1;
+            completed_files += 2;
+            progress(completed_files, total_files, "");
             continue;
         }
         let destination = if conflict && strategy == ConflictStrategy::Rename {
@@ -450,10 +499,20 @@ pub fn export_photos(
         } else {
             original
         };
-        match copy_pair(&root, &destination, &item) {
+        match copy_pair_controlled(
+            &root,
+            &destination,
+            &item,
+            &mut completed_files,
+            total_files,
+            &mut progress,
+            &mut checkpoint,
+        ) {
             Ok(()) => summary.succeeded += 1,
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
             Err(error) => {
                 summary.failed += 1;
+                completed_files = ((completed_files / 2 + 1) * 2).min(total_files);
                 summary.failures.push(ExportFailure {
                     photo_id: item.id,
                     name: item.base_name.clone(),
@@ -461,13 +520,14 @@ pub fn export_photos(
                 });
             }
         }
+        progress(completed_files, total_files, "");
     }
     Ok(summary)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write};
+    use std::{cell::Cell, fs::File, io::Write};
 
     use super::*;
 
@@ -554,5 +614,45 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         File::create(directory.path().join("existing.txt")).unwrap();
         assert!(validate_empty_directory(directory.path()).is_err());
+    }
+
+    #[test]
+    fn cancellation_between_pair_files_removes_the_partial_copy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let photo_root = workspace.path().join("photos");
+        std::fs::create_dir(&photo_root).unwrap();
+        image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]))
+            .save(photo_root.join("PAIR.JPG"))
+            .unwrap();
+        File::create(photo_root.join("PAIR.ARW"))
+            .unwrap()
+            .write_all(b"raw")
+            .unwrap();
+        let database = workspace.path().join("project.sqlite");
+        db::create_project(&database, &photo_root).unwrap();
+        crate::scan::scan_project(&database).unwrap();
+        let export_root = workspace.path().join("export");
+        std::fs::create_dir(&export_root).unwrap();
+        let checkpoints = Cell::new(0);
+
+        let result = export_photos_controlled(
+            &database,
+            &export_root,
+            "skip",
+            |_, _, _| {},
+            || {
+                let current = checkpoints.get();
+                checkpoints.set(current + 1);
+                if current == 2 {
+                    Err(AppError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(!export_root.join("PAIR.JPG").exists());
+        assert!(!export_root.join("PAIR.ARW").exists());
     }
 }

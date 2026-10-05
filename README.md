@@ -49,5 +49,6 @@ macOS `.app` 位于 `src-tauri/target/release/bundle/macos/`；需要在对应�
 - 每个项目可为标签绑定唯一的数字快捷键 `1`–`9`，浏览时按数字即可分配标签并自动跳到下一张。
 - 数据库结构版本存放在 `project_settings.schema_version`。后续结构变更应增加版本并执行向前迁移，不能删除旧数据库。
 - 个人版在构建期内置百度网盘 AppKey 和 SecretKey；登录时只临时监听本机回调地址，授权完成后立即停止。Access Token 和 Refresh Token 保存在操作系统钥匙串中。导出目标限定为用户选择的空目录。
+- 本地导出和百度网盘上传在后台任务中运行；底部任务中心显示进度与会话记录，并支持暂停、继续和取消。
 
 完整产品和数据规则见 [photo_tagger_vibe_prompt.md](./photo_tagger_vibe_prompt.md)。

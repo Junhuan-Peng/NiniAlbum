@@ -1,17 +1,18 @@
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     baidu,
     db::{self, AppState},
-    error::CommandResult,
+    error::{AppError, CommandResult},
     export,
     models::{
-        BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportProgress,
-        ExportSummary, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary,
+        BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportTask, PhotoQuery,
+        ProjectInfo, ProjectSnapshot, ScanSummary,
     },
     scan,
+    tasks::ExportTaskManager,
 };
 
 #[tauri::command]
@@ -239,18 +240,45 @@ pub fn plan_export(state: State<'_, AppState>, export_root: String) -> Result<Ex
     .command()
 }
 
+fn emit_export_task(app: &AppHandle, task: &ExportTask) {
+    let _ = app.emit("export-task-update", task);
+}
+
 #[tauri::command]
-pub async fn export_photos(
+pub fn start_local_export(
+    app: AppHandle,
     state: State<'_, AppState>,
+    tasks: State<'_, ExportTaskManager>,
     export_root: String,
     strategy: String,
-) -> Result<ExportSummary, String> {
+) -> Result<ExportTask, String> {
     let database_path = state.project_path().command()?;
+    let (task, control) = tasks.create("local", export_root.clone()).command()?;
+    emit_export_task(&app, &task);
+    let task_id = task.id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        export::export_photos(&database_path, &PathBuf::from(export_root), &strategy).command()
-    })
-    .await
-    .map_err(|error| error.to_string())?
+        let manager = app.state::<ExportTaskManager>();
+        let result = export::export_photos_controlled(
+            &database_path,
+            &PathBuf::from(export_root),
+            &strategy,
+            |completed, total, file| {
+                if let Some(snapshot) = manager.progress(&task_id, completed, total, file) {
+                    emit_export_task(&app, &snapshot);
+                }
+            },
+            || control.checkpoint(),
+        );
+        let snapshot = match result {
+            Ok(summary) => manager.complete(&task_id, summary),
+            Err(AppError::Cancelled) => manager.cancelled(&task_id),
+            Err(error) => manager.fail(&task_id, error.to_string()),
+        };
+        if let Some(snapshot) = snapshot {
+            emit_export_task(&app, &snapshot);
+        }
+    });
+    Ok(task)
 }
 
 #[tauri::command]
@@ -298,32 +326,82 @@ pub async fn plan_baidu_export(
 }
 
 #[tauri::command]
-pub async fn export_to_baidu(
+pub fn start_baidu_export(
     app: AppHandle,
     state: State<'_, AppState>,
+    tasks: State<'_, ExportTaskManager>,
     root: String,
     strategy: String,
-) -> Result<ExportSummary, String> {
+) -> Result<ExportTask, String> {
     let database_path = state.project_path().command()?;
+    let (task, control) = tasks.create("baidu", root.clone()).command()?;
+    emit_export_task(&app, &task);
+    let task_id = task.id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        baidu::export_photos(
+        let manager = app.state::<ExportTaskManager>();
+        let result = baidu::export_photos(
             &database_path,
             &root,
             &strategy,
             |completed, total, file| {
-                let _ = app.emit(
-                    "export-progress",
-                    ExportProgress {
-                        destination: "baidu".into(),
-                        completed_files: completed,
-                        total_files: total,
-                        current_file: file.into(),
-                    },
-                );
+                if let Some(snapshot) = manager.progress(&task_id, completed, total, file) {
+                    emit_export_task(&app, &snapshot);
+                }
             },
-        )
-        .command()
-    })
-    .await
-    .map_err(|error| error.to_string())?
+            || control.checkpoint(),
+        );
+        let snapshot = match result {
+            Ok(summary) => manager.complete(&task_id, summary),
+            Err(AppError::Cancelled) => manager.cancelled(&task_id),
+            Err(error) => manager.fail(&task_id, error.to_string()),
+        };
+        if let Some(snapshot) = snapshot {
+            emit_export_task(&app, &snapshot);
+        }
+    });
+    Ok(task)
+}
+
+#[tauri::command]
+pub fn list_export_tasks(tasks: State<'_, ExportTaskManager>) -> Vec<ExportTask> {
+    tasks.list()
+}
+
+#[tauri::command]
+pub fn pause_export_task(
+    app: AppHandle,
+    tasks: State<'_, ExportTaskManager>,
+    task_id: String,
+) -> Result<ExportTask, String> {
+    let task = tasks.pause(&task_id).command()?;
+    emit_export_task(&app, &task);
+    Ok(task)
+}
+
+#[tauri::command]
+pub fn resume_export_task(
+    app: AppHandle,
+    tasks: State<'_, ExportTaskManager>,
+    task_id: String,
+) -> Result<ExportTask, String> {
+    let task = tasks.resume(&task_id).command()?;
+    emit_export_task(&app, &task);
+    Ok(task)
+}
+
+#[tauri::command]
+pub fn cancel_export_task(
+    app: AppHandle,
+    tasks: State<'_, ExportTaskManager>,
+    task_id: String,
+) -> Result<ExportTask, String> {
+    let task = tasks.cancel(&task_id).command()?;
+    emit_export_task(&app, &task);
+    Ok(task)
+}
+
+#[tauri::command]
+pub fn clear_finished_export_tasks(tasks: State<'_, ExportTaskManager>) -> Vec<ExportTask> {
+    tasks.clear_finished();
+    tasks.list()
 }

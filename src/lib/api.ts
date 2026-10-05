@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
-  BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportSummary, PhotoEntry, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary
+  BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportTask, PhotoEntry, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary
 } from './types';
 
 export const api = {
@@ -30,13 +30,18 @@ export const api = {
   deleteMissing: (ids: number[]) => invoke<number>('delete_missing', { ids }),
   checkpoint: () => invoke<void>('checkpoint'),
   planExport: (exportRoot: string) => invoke<ExportPlan>('plan_export', { exportRoot }),
-  exportPhotos: (exportRoot: string, strategy: string) =>
-    invoke<ExportSummary>('export_photos', { exportRoot, strategy }),
+  startLocalExport: (exportRoot: string, strategy: string) =>
+    invoke<ExportTask>('start_local_export', { exportRoot, strategy }),
   baiduStatus: () => invoke<BaiduStatus>('baidu_status'),
   openBaiduAuthorization: () => invoke<string>('open_baidu_authorization'),
   disconnectBaidu: () => invoke<void>('disconnect_baidu'),
   listBaiduFolders: (directory?: string) => invoke<BaiduDirectoryListing>('list_baidu_folders', { directory }),
   createBaiduFolder: (parent: string, name: string) => invoke<string>('create_baidu_folder', { parent, name }),
   planBaiduExport: (root: string) => invoke<ExportPlan>('plan_baidu_export', { root }),
-  exportToBaidu: (root: string, strategy: string) => invoke<ExportSummary>('export_to_baidu', { root, strategy })
+  startBaiduExport: (root: string, strategy: string) => invoke<ExportTask>('start_baidu_export', { root, strategy }),
+  exportTasks: () => invoke<ExportTask[]>('list_export_tasks'),
+  pauseExportTask: (taskId: string) => invoke<ExportTask>('pause_export_task', { taskId }),
+  resumeExportTask: (taskId: string) => invoke<ExportTask>('resume_export_task', { taskId }),
+  cancelExportTask: (taskId: string) => invoke<ExportTask>('cancel_export_task', { taskId }),
+  clearFinishedExportTasks: () => invoke<ExportTask[]>('clear_finished_export_tasks')
 };

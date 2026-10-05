@@ -8,7 +8,7 @@
   import TagBranch from './lib/components/TagBranch.svelte';
   import { api } from './lib/api';
   import { toast } from './lib/toast';
-  import type { BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportProgress, PhotoEntry, PhotoFilter, ProjectSnapshot, ScanProgress, SortDirection, SortField, TagNode } from './lib/types';
+  import type { BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportTask, PhotoEntry, PhotoFilter, ProjectSnapshot, ScanProgress, SortDirection, SortField, TagNode } from './lib/types';
 
   let snapshot: ProjectSnapshot | null = null;
   let selectedIndex = 0;
@@ -60,6 +60,8 @@
   let lastChangeCheck = 0;
   let maintenanceRunning = false;
   let sourceChanged = false;
+  let exportTasks: ExportTask[] = [];
+  let taskPanelOpen = false;
 
   const previewCache = new Map<number, string>();
   const previewInFlight = new Map<number, Promise<string>>();
@@ -88,6 +90,7 @@
     : 0;
   $: projectFolderName = snapshot ? pathLastPart(snapshot.project.photoRoot) : 'Nini Albums';
   $: projectInitial = Array.from(projectFolderName.trim())[0]?.toUpperCase() ?? 'N';
+  $: activeExportTasks = exportTasks.filter((task) => ['queued', 'running', 'paused', 'cancelling'].includes(task.status));
 
   const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -103,6 +106,53 @@
 
   function pathLastPart(path: string) {
     return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path;
+  }
+
+  function exportTaskLabel(task: ExportTask) {
+    const labels = {
+      queued: '等待中', running: '正在导出', paused: '已暂停', cancelling: '正在取消',
+      completed: '已完成', failed: '失败', cancelled: '已取消'
+    } as const;
+    return labels[task.status];
+  }
+
+  function exportTaskPercent(task: ExportTask) {
+    if (task.status === 'completed') return 100;
+    return task.totalFiles > 0 ? Math.min(100, Math.round(task.completedFiles / task.totalFiles * 100)) : 0;
+  }
+
+  function upsertExportTask(task: ExportTask, announce = false) {
+    const previous = exportTasks.find((item) => item.id === task.id);
+    const previousEnded = previous && ['completed', 'failed', 'cancelled'].includes(previous.status);
+    if ((task.status === 'queued' && previous && previous.status !== 'queued')
+      || (previousEnded && !['completed', 'failed', 'cancelled'].includes(task.status))) return;
+    exportTasks = [task, ...exportTasks.filter((item) => item.id !== task.id)]
+      .sort((left, right) => right.createdAt - left.createdAt);
+    if (!announce || previous?.status === task.status) return;
+    if (task.status === 'completed' && task.summary) {
+      const result = task.summary;
+      toast(`导出完成：成功 ${result.succeeded}，跳过 ${result.skipped}，失败 ${result.failed}${result.renamed ? `，改名 ${result.renamed}` : ''}`, result.failed ? 'error' : 'success', 7000);
+    } else if (task.status === 'failed') {
+      toast(`导出失败：${task.error ?? '未知错误'}`, 'error', 7000);
+    } else if (task.status === 'cancelled') {
+      toast('导出任务已取消。');
+    }
+  }
+
+  async function controlExportTask(action: 'pause' | 'resume' | 'cancel', task: ExportTask) {
+    try {
+      const updated = action === 'pause'
+        ? await api.pauseExportTask(task.id)
+        : action === 'resume'
+          ? await api.resumeExportTask(task.id)
+          : await api.cancelExportTask(task.id);
+      upsertExportTask(updated);
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function clearFinishedExportTasks() {
+    try { exportTasks = await api.clearFinishedExportTasks(); }
+    catch (error) { toast(errorMessage(error), 'error'); }
   }
 
   function saveSettings() {
@@ -645,10 +695,14 @@
   async function confirmExport() {
     if (!exportDialog) return;
     const { root, strategy, destination } = exportDialog; exportDialog = null;
-    await runBusy(destination === 'baidu' ? '正在上传到百度网盘…' : '正在复制 JPEG 与 ARW…', async () => {
-      const result = destination === 'baidu' ? await api.exportToBaidu(root, strategy) : await api.exportPhotos(root, strategy);
-      toast(`导出完成：成功 ${result.succeeded}，跳过 ${result.skipped}，失败 ${result.failed}${result.renamed ? `，改名 ${result.renamed}` : ''}`, result.failed ? 'error' : 'success', 7000);
-    });
+    try {
+      const task = destination === 'baidu'
+        ? await api.startBaiduExport(root, strategy)
+        : await api.startLocalExport(root, strategy);
+      upsertExportTask(task);
+      taskPanelOpen = true;
+      toast('导出任务已开始，可在底部任务中心查看。', 'success');
+    } catch (error) { toast(errorMessage(error), 'error'); }
   }
 
   async function startBaiduAuthorization() {
@@ -687,7 +741,7 @@
   function handleKeydown(event: KeyboardEvent) {
     const target = event.target as HTMLElement;
     if (['INPUT','TEXTAREA','SELECT'].includes(target.tagName) || target.isContentEditable) return;
-    if (!snapshot || tagDialog || shortcutDialog || deleteDialog || exportDestinationDialog || exportDialog || baiduBrowser || existingProjectDialog || settingsDialog) return;
+    if (!snapshot || tagDialog || shortcutDialog || deleteDialog || exportDestinationDialog || exportDialog || baiduBrowser || existingProjectDialog || settingsDialog || taskPanelOpen) return;
     if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
     if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
     if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
@@ -795,10 +849,9 @@
         ? `${payload.message} ${payload.completed}/${payload.total}`
         : payload.message;
     }).then((dispose) => { unlisten = dispose; }).catch(() => { /* Browser-only preview has no Tauri event bridge. */ });
-    listen<ExportProgress>('export-progress', ({ payload }) => {
-      busyLabel = payload.totalFiles > 0
-        ? `正在上传 ${payload.currentFile} ${payload.completedFiles}/${payload.totalFiles}`
-        : '正在准备上传…';
+    api.exportTasks().then((tasks) => { exportTasks = tasks; }).catch(() => { /* Browser-only preview has no Tauri bridge. */ });
+    listen<ExportTask>('export-task-update', ({ payload }) => {
+      upsertExportTask(payload, true);
     }).then((dispose) => { unlistenExport = dispose; }).catch(() => { /* Browser-only preview has no Tauri event bridge. */ });
     return () => { unlisten?.(); unlistenExport?.(); window.clearInterval(maintenanceTimer); };
   });
@@ -806,7 +859,7 @@
 
 <svelte:window on:keydown|capture={handleKeydown} on:contextmenu|preventDefault />
 
-<main class="flex h-full min-h-0 flex-col bg-background text-foreground">
+<main class="relative flex h-full min-h-0 flex-col bg-background text-foreground">
   <header class="flex h-16 shrink-0 items-center gap-3 border-b border-border bg-[#15171a] px-4">
     <div class="flex min-w-0 items-center gap-3"><div class="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-accent text-lg font-black text-black">{projectInitial}</div><div class="min-w-0 leading-tight"><strong class="block max-w-64 truncate text-sm">{projectFolderName}</strong><span class="block max-w-72 truncate text-[10px] text-muted">{snapshot?.project.photoRoot ?? '本地照片标注工具'}</span></div></div>
     {#if snapshot}
@@ -915,7 +968,41 @@
         <div class="border-t border-border p-3 text-[10px] leading-5 text-muted">单击立即分配 · 1–9 分配并前进<br />空格重复分配并前进 · ↑ ↓ 切换照片</div>
       </aside>
     </section>
-    <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{currentListIndex >= 0 ? currentListIndex + 1 : '组内'} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span>{#if hiddenSimilarityCount}<span>相似图隐藏 {hiddenSimilarityCount}</span>{/if}<span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span>{#if snapshot.counts.trashed}<span class="text-danger">回收站 {snapshot.counts.trashed}</span>{/if}<span class="ml-auto max-w-[35%] truncate">{snapshot.project.photoRoot}</span></footer>
+    {#if taskPanelOpen}
+      <section class="absolute bottom-8 left-0 right-0 z-40 flex max-h-[42vh] flex-col border-y border-border bg-[#17191d]/[.98] shadow-[0_-14px_35px_rgba(0,0,0,.45)] backdrop-blur">
+        <header class="flex h-10 shrink-0 items-center border-b border-border px-3">
+          <strong class="text-xs">导出任务</strong>
+          <span class="ml-2 text-[10px] text-muted">{activeExportTasks.length} 个进行中 · {exportTasks.length} 条记录</span>
+          <button class="ml-auto rounded px-2 py-1 text-[10px] text-muted hover:bg-white/5 hover:text-foreground disabled:opacity-40" disabled={exportTasks.length === activeExportTasks.length} on:click={clearFinishedExportTasks}>清除已结束</button>
+          <button class="ml-1 grid h-7 w-7 place-items-center rounded text-muted hover:bg-white/5 hover:text-foreground" aria-label="关闭任务面板" on:click={() => taskPanelOpen = false}>×</button>
+        </header>
+        <div class="min-h-0 overflow-y-auto">
+          {#each exportTasks as task (task.id)}
+            {@const percent = exportTaskPercent(task)}
+            <article class="grid grid-cols-[minmax(180px,1.5fr)_minmax(140px,1fr)_100px_170px] items-center gap-4 border-b border-border/70 px-3 py-3 last:border-b-0">
+              <div class="min-w-0">
+                <div class="flex items-center gap-2"><span class="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-white/5 text-xs">{task.destination === 'baidu' ? '云' : '本'}</span><div class="min-w-0"><div class="truncate text-xs font-medium">{task.destination === 'baidu' ? '百度网盘导出' : '本地导出'}</div><div class="mt-0.5 truncate text-[9px] text-muted" title={task.root}>{task.root}</div></div></div>
+              </div>
+              <div class="min-w-0">
+                <div class="flex justify-between text-[10px]"><span class:!text-accent={task.status === 'completed'} class:!text-danger={task.status === 'failed'} class="text-muted">{exportTaskLabel(task)}</span><span>{task.completedFiles}/{task.totalFiles || '—'}</span></div>
+                <div class="mt-1.5 h-1 overflow-hidden rounded-full bg-white/10"><div class="h-full rounded-full transition-[width] duration-200" class:bg-danger={task.status === 'failed'} class:bg-accent={task.status !== 'failed'} style={`width:${percent}%`}></div></div>
+              </div>
+              <div class="truncate text-[9px] text-muted" title={task.currentFile || task.error || ''}>{task.error ?? task.currentFile ?? ''}</div>
+              <div class="flex justify-end gap-1.5">
+                {#if task.status === 'running' || task.status === 'queued'}<button class="rounded border border-border px-2 py-1 text-[10px] hover:border-accent/50" on:click={() => controlExportTask('pause', task)}>暂停</button>{/if}
+                {#if task.status === 'paused'}<button class="rounded border border-accent/40 px-2 py-1 text-[10px] text-accent" on:click={() => controlExportTask('resume', task)}>继续</button>{/if}
+                {#if ['queued', 'running', 'paused'].includes(task.status)}<button class="rounded border border-border px-2 py-1 text-[10px] text-muted hover:border-danger/60 hover:text-danger" on:click={() => controlExportTask('cancel', task)}>取消</button>{/if}
+                {#if task.status === 'cancelling'}<span class="px-2 py-1 text-[10px] text-muted">等待当前操作结束…</span>{/if}
+                {#if task.summary}<span class="px-2 py-1 text-[10px] text-muted">成功 {task.summary.succeeded} · 失败 {task.summary.failed}</span>{/if}
+              </div>
+            </article>
+          {:else}
+            <div class="grid min-h-24 place-items-center text-xs text-muted">还没有导出任务</div>
+          {/each}
+        </div>
+      </section>
+    {/if}
+    <footer class="flex h-8 shrink-0 items-center gap-4 border-t border-border bg-[#15171a] px-3 text-[11px] text-muted"><span>{currentListIndex >= 0 ? currentListIndex + 1 : '组内'} / {photos.length}</span><span>项目总数 {snapshot.counts.total}</span><span>已标记 {snapshot.counts.tagged}</span>{#if hiddenSimilarityCount}<span>相似图隐藏 {hiddenSimilarityCount}</span>{/if}<span>缺配对 {snapshot.counts.incomplete}</span><span>冲突 {snapshot.counts.conflicts}</span><span>丢失 {snapshot.counts.missing}</span>{#if snapshot.counts.trashed}<span class="text-danger">回收站 {snapshot.counts.trashed}</span>{/if}<button class="ml-auto flex h-6 items-center gap-1.5 rounded px-2 hover:bg-white/5 hover:text-foreground" class:text-accent={activeExportTasks.length > 0} aria-expanded={taskPanelOpen} on:click={() => taskPanelOpen = !taskPanelOpen}><span>任务</span>{#if activeExportTasks.length}<span class="min-w-4 rounded-full bg-accent px-1 text-center text-[8px] font-bold leading-4 text-black">{activeExportTasks.length}</span>{:else if exportTasks.length}<span class="text-[9px]">{exportTasks.length}</span>{/if}<span class="text-[9px]">{taskPanelOpen ? '⌄' : '⌃'}</span></button><span class="max-w-[28%] truncate">{snapshot.project.photoRoot}</span></footer>
   {:else}
     <section class="min-h-0 flex-1 overflow-y-auto bg-[radial-gradient(circle_at_top,#20242a_0,#101113_58%)] p-8"><div class="mx-auto flex min-h-full max-w-3xl flex-col justify-center py-8"><div class="text-center"><div class="mx-auto grid h-20 w-20 place-items-center rounded-3xl border border-accent/30 bg-accent/10 text-4xl font-black text-accent">N</div><h1 class="mt-7 text-3xl font-semibold">把照片，整理成你熟悉的样子</h1><p class="mt-3 leading-7 text-muted">在本地完成配对、归类与导出，原片始终留在原处。</p><div class="mt-7 flex justify-center gap-3"><Button variant="primary" on:click={createProject}>新建项目</Button><Button on:click={openProject}>打开已有项目</Button></div></div>{#if recentProjects.length}<div class="mt-12"><div class="mb-3 flex items-center justify-between"><h2 class="text-sm font-semibold">最近打开</h2><span class="text-[10px] text-muted">最多保留 6 个项目</span></div><div class="grid gap-2 sm:grid-cols-2">{#each recentProjects as recent}<button class="group rounded-xl border border-border bg-panel/80 p-3 text-left transition hover:border-accent/40 hover:bg-white/5" on:click={() => openRecentProject(recent.path)}><div class="flex items-center gap-3"><div class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/10 text-sm font-bold text-accent">N</div><div class="min-w-0"><div class="truncate text-sm font-medium group-hover:text-accent">{recent.name}</div><div class="mt-0.5 truncate text-[10px] text-muted">{recent.photoRoot}</div></div></div></button>{/each}</div></div>{/if}</div></section>
   {/if}
