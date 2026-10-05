@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
   sort_field TEXT NOT NULL DEFAULT 'file_name'
     CHECK (sort_field IN ('file_name','relative_path','modified_time','tagged_status','missing_status')),
   sort_direction TEXT NOT NULL DEFAULT 'asc' CHECK (sort_direction IN ('asc','desc')),
-  schema_version INTEGER NOT NULL DEFAULT 1,
+  schema_version INTEGER NOT NULL DEFAULT 2,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -84,6 +84,23 @@ CREATE TABLE IF NOT EXISTS photo_entries (
   tag_id INTEGER NULL REFERENCES tag_tree(id) ON DELETE RESTRICT,
   thumbnail_blob BLOB NULL,
   thumbnail_mime TEXT NULL,
+  pixel_width INTEGER NULL,
+  pixel_height INTEGER NULL,
+  orientation INTEGER NULL,
+  captured_at TEXT NULL,
+  camera_make TEXT NULL,
+  camera_model TEXT NULL,
+  lens_model TEXT NULL,
+  exposure_time TEXT NULL,
+  aperture TEXT NULL,
+  iso INTEGER NULL,
+  focal_length TEXT NULL,
+  latitude REAL NULL,
+  longitude REAL NULL,
+  perceptual_hash INTEGER NULL,
+  date_group TEXT NULL,
+  location_group TEXT NULL,
+  similarity_group TEXT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(relative_dir, pairing_key)
@@ -112,6 +129,49 @@ CREATE INDEX IF NOT EXISTS idx_file_content_hash ON photo_files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_file_last_seen ON photo_files(last_seen_scan_id);
 "#;
 
+const PHOTO_ENTRY_COLUMNS: &[(&str, &str)] = &[
+    ("pixel_width", "INTEGER NULL"),
+    ("pixel_height", "INTEGER NULL"),
+    ("orientation", "INTEGER NULL"),
+    ("captured_at", "TEXT NULL"),
+    ("camera_make", "TEXT NULL"),
+    ("camera_model", "TEXT NULL"),
+    ("lens_model", "TEXT NULL"),
+    ("exposure_time", "TEXT NULL"),
+    ("aperture", "TEXT NULL"),
+    ("iso", "INTEGER NULL"),
+    ("focal_length", "TEXT NULL"),
+    ("latitude", "REAL NULL"),
+    ("longitude", "REAL NULL"),
+    ("perceptual_hash", "INTEGER NULL"),
+    ("date_group", "TEXT NULL"),
+    ("location_group", "TEXT NULL"),
+    ("similarity_group", "TEXT NULL"),
+];
+
+fn migrate(connection: &Connection) -> AppResult<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(photo_entries)")?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    drop(statement);
+    for (name, definition) in PHOTO_ENTRY_COLUMNS {
+        if !existing.contains(*name) {
+            connection.execute_batch(&format!(
+                "ALTER TABLE photo_entries ADD COLUMN {name} {definition};"
+            ))?;
+        }
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_photo_captured_at ON photo_entries(captured_at);
+         CREATE INDEX IF NOT EXISTS idx_photo_date_group ON photo_entries(date_group);
+         CREATE INDEX IF NOT EXISTS idx_photo_location_group ON photo_entries(location_group);
+         CREATE INDEX IF NOT EXISTS idx_photo_similarity_group ON photo_entries(similarity_group);
+         UPDATE project_settings SET schema_version=2 WHERE id=1 AND schema_version<2;",
+    )?;
+    Ok(())
+}
+
 pub fn connect(path: &Path) -> AppResult<Connection> {
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -132,8 +192,9 @@ pub fn create_project(database_path: &Path, photo_root: &Path) -> AppResult<()> 
     }
     let connection = connect(database_path)?;
     connection.execute_batch(SCHEMA)?;
+    migrate(&connection)?;
     connection.execute(
-        "INSERT INTO project_settings (id, photo_root) VALUES (1, ?1)",
+        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 2)",
         [photo_root.to_string_lossy().as_ref()],
     )?;
     Ok(())
@@ -145,6 +206,7 @@ pub fn open_project(database_path: &Path) -> AppResult<ProjectInfo> {
     }
     let connection = connect(database_path)?;
     connection.execute_batch(SCHEMA)?;
+    migrate(&connection)?;
     project_info(&connection, database_path)
 }
 
@@ -344,7 +406,9 @@ pub fn list_photos(connection: &Connection, query: &PhotoQuery) -> AppResult<Vec
         (SELECT relative_path FROM photo_files WHERE photo_entry_id=e.id AND file_kind='jpeg' AND is_missing=0 ORDER BY id LIMIT 1),
         (SELECT relative_path FROM photo_files WHERE photo_entry_id=e.id AND file_kind='arw' AND is_missing=0 ORDER BY id LIMIT 1),
         (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0) AS modified_time,
-        e.thumbnail_blob,e.thumbnail_mime
+        e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
+        e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
+        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group
       FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
       WHERE {filter} ORDER BY {}"#,
         order_clause(field, direction)
@@ -372,6 +436,22 @@ pub fn list_photos(connection: &Connection, query: &PhotoQuery) -> AppResult<Vec
             raw_relative_path: row.get(8)?,
             modified_time: row.get(9)?,
             thumbnail_data_url,
+            pixel_width: row.get(12)?,
+            pixel_height: row.get(13)?,
+            orientation: row.get(14)?,
+            captured_at: row.get(15)?,
+            camera_make: row.get(16)?,
+            camera_model: row.get(17)?,
+            lens_model: row.get(18)?,
+            exposure_time: row.get(19)?,
+            aperture: row.get(20)?,
+            iso: row.get(21)?,
+            focal_length: row.get(22)?,
+            latitude: row.get(23)?,
+            longitude: row.get(24)?,
+            date_group: row.get(25)?,
+            location_group: row.get(26)?,
+            similarity_group: row.get(27)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
@@ -467,5 +547,33 @@ mod tests {
             .query_row("SELECT tag_id FROM photo_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tag, None);
+    }
+
+    #[test]
+    fn migrates_existing_projects_with_smart_metadata_columns() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE project_settings(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL DEFAULT 1);
+                 INSERT INTO project_settings(id) VALUES(1);
+                 CREATE TABLE photo_entries(id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        migrate(&connection).unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(photo_entries)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(columns.contains("captured_at"));
+        assert!(columns.contains("similarity_group"));
+        let version: i64 = connection
+            .query_row("SELECT schema_version FROM project_settings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 2);
     }
 }

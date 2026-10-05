@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -11,7 +11,8 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{codecs::jpeg::JpegEncoder, ImageReader};
+use exif::{In, Tag, Value};
+use image::{codecs::jpeg::JpegEncoder, DynamicImage, GenericImageView, ImageReader};
 use rayon::prelude::*;
 use rusqlite::{params, OptionalExtension, Transaction};
 use walkdir::WalkDir;
@@ -72,6 +73,30 @@ struct FileCandidate {
     kind: FileKind,
     key: GroupKey,
     display_base_name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PhotoMetadata {
+    pixel_width: Option<u32>,
+    pixel_height: Option<u32>,
+    orientation: Option<u16>,
+    captured_at: Option<String>,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+    lens_model: Option<String>,
+    exposure_time: Option<String>,
+    aperture: Option<String>,
+    iso: Option<u32>,
+    focal_length: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    perceptual_hash: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PhotoArtifact {
+    thumbnail: Option<Vec<u8>>,
+    metadata: PhotoMetadata,
 }
 
 pub type ProgressCallback = Arc<dyn Fn(ScanProgress) + Send + Sync>;
@@ -359,18 +384,137 @@ fn collect_groups(
     Ok((groups, warnings, discovered))
 }
 
-fn thumbnail(path: &Path) -> AppResult<Vec<u8>> {
+fn display_field(exif: &exif::Exif, tag: Tag) -> Option<String> {
+    exif.get_field(tag, In::PRIMARY)
+        .map(|field| field.display_value().with_unit(exif).to_string())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn ascii_field(exif: &exif::Exif, tag: Tag) -> Option<String> {
+    let field = exif.get_field(tag, In::PRIMARY)?;
+    match &field.value {
+        Value::Ascii(values) => values.first().map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .trim_matches(char::from(0))
+                .trim()
+                .to_string()
+        }),
+        _ => display_field(exif, tag),
+    }
+    .filter(|value| !value.is_empty())
+}
+
+fn gps_coordinate(exif: &exif::Exif, value_tag: Tag, reference_tag: Tag) -> Option<f64> {
+    let field = exif.get_field(value_tag, In::PRIMARY)?;
+    let Value::Rational(values) = &field.value else {
+        return None;
+    };
+    if values.len() < 3 {
+        return None;
+    }
+    let decimal = values[0].to_f64() + values[1].to_f64() / 60.0 + values[2].to_f64() / 3600.0;
+    let reference = ascii_field(exif, reference_tag)?;
+    Some(if matches!(reference.as_str(), "S" | "W") {
+        -decimal
+    } else {
+        decimal
+    })
+}
+
+fn normalize_exif_date(value: String) -> Option<String> {
+    if value.len() < 19 {
+        return None;
+    }
+    let mut bytes = value.into_bytes();
+    if bytes.get(4) == Some(&b':') && bytes.get(7) == Some(&b':') {
+        bytes[4] = b'-';
+        bytes[7] = b'-';
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .map(|value| value[..19].to_string())
+}
+
+fn read_exif(path: &Path) -> PhotoMetadata {
+    let Ok(file) = File::open(path) else {
+        return PhotoMetadata::default();
+    };
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut BufReader::new(file)) else {
+        return PhotoMetadata::default();
+    };
+    let orientation = exif
+        .get_field(Tag::Orientation, In::PRIMARY)
+        .and_then(|field| field.value.get_uint(0))
+        .map(|value| value as u16);
+    PhotoMetadata {
+        orientation,
+        captured_at: display_field(&exif, Tag::DateTimeOriginal).and_then(normalize_exif_date),
+        camera_make: ascii_field(&exif, Tag::Make),
+        camera_model: ascii_field(&exif, Tag::Model),
+        lens_model: ascii_field(&exif, Tag::LensModel),
+        exposure_time: display_field(&exif, Tag::ExposureTime),
+        aperture: display_field(&exif, Tag::FNumber),
+        iso: exif
+            .get_field(Tag::PhotographicSensitivity, In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0)),
+        focal_length: display_field(&exif, Tag::FocalLength),
+        latitude: gps_coordinate(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef),
+        longitude: gps_coordinate(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef),
+        ..Default::default()
+    }
+}
+
+fn orient_image(image: DynamicImage, orientation: Option<u16>) -> DynamicImage {
+    match orientation.unwrap_or(1) {
+        2 => image.fliph(),
+        3 => image.rotate180(),
+        4 => image.flipv(),
+        5 => image.rotate90().fliph(),
+        6 => image.rotate90(),
+        7 => image.rotate270().fliph(),
+        8 => image.rotate270(),
+        _ => image,
+    }
+}
+
+fn difference_hash(image: &DynamicImage) -> u64 {
+    let gray = image
+        .resize_exact(9, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let mut hash = 0_u64;
+    for y in 0..8 {
+        for x in 0..8 {
+            hash <<= 1;
+            if gray.get_pixel(x, y)[0] > gray.get_pixel(x + 1, y)[0] {
+                hash |= 1;
+            }
+        }
+    }
+    hash
+}
+
+fn photo_artifact(path: &Path) -> AppResult<PhotoArtifact> {
+    let mut metadata = read_exif(path);
     let image = ImageReader::open(path)?.with_guessed_format()?.decode()?;
+    let image = orient_image(image, metadata.orientation);
+    let (width, height) = image.dimensions();
+    metadata.pixel_width = Some(width);
+    metadata.pixel_height = Some(height);
+    metadata.perceptual_hash = Some(difference_hash(&image));
     let thumb = image.thumbnail(480, 480);
     let mut bytes = Vec::new();
     JpegEncoder::new_with_quality(&mut bytes, 80).encode_image(&thumb)?;
-    Ok(bytes)
+    Ok(PhotoArtifact {
+        thumbnail: Some(bytes),
+        metadata,
+    })
 }
 
-fn generate_thumbnails(
+fn generate_artifacts(
     groups: &[ScannedGroup],
     progress: &ProgressCallback,
-) -> Vec<Result<Option<Vec<u8>>, String>> {
+) -> Vec<Result<PhotoArtifact, String>> {
     let total = groups.len();
     let completed = AtomicUsize::new(0);
     report(progress, "thumbnails", 0, total, "正在并发生成 JPEG 缩略图");
@@ -379,15 +523,21 @@ fn generate_thumbnails(
             .par_iter()
             .map(|group| {
                 let result = if classify_group(&group.files) == "conflict" {
-                    Ok(None)
+                    Ok(PhotoArtifact {
+                        thumbnail: None,
+                        metadata: PhotoMetadata::default(),
+                    })
                 } else if let Some(jpeg) =
                     group.files.iter().find(|file| file.kind == FileKind::Jpeg)
                 {
-                    thumbnail(&jpeg.absolute_path).map(Some).map_err(|error| {
+                    photo_artifact(&jpeg.absolute_path).map_err(|error| {
                         format!("缩略图生成失败 {}：{error}", jpeg.absolute_path.display())
                     })
                 } else {
-                    Ok(None)
+                    Ok(PhotoArtifact {
+                        thumbnail: None,
+                        metadata: PhotoMetadata::default(),
+                    })
                 };
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(10) || done == total {
@@ -419,9 +569,10 @@ pub fn photo_preview(database_path: &Path, photo_id: i64) -> AppResult<String> {
         [photo_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let image = ImageReader::open(PathBuf::from(root).join(relative))?
-        .with_guessed_format()?
-        .decode()?;
+    let path = PathBuf::from(root).join(relative);
+    let metadata = read_exif(&path);
+    let image = ImageReader::open(path)?.with_guessed_format()?.decode()?;
+    let image = orient_image(image, metadata.orientation);
     let preview = image.thumbnail(2400, 2400);
     let mut bytes = Vec::new();
     JpegEncoder::new_with_quality(&mut bytes, 88).encode_image(&preview)?;
@@ -503,6 +654,95 @@ fn refresh_entry_status(transaction: &Transaction<'_>, entry_id: i64) -> AppResu
     Ok(())
 }
 
+fn timestamp_seconds(value: &str) -> Option<i64> {
+    let values = value
+        .split(['-', ' ', ':'])
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() != 6 {
+        return None;
+    }
+    let (mut year, month, day) = (values[0], values[1], values[2]);
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + values[3] * 3_600 + values[4] * 60 + values[5])
+}
+
+fn refresh_smart_groups(transaction: &Transaction<'_>) -> AppResult<()> {
+    transaction.execute(
+        "UPDATE photo_entries SET date_group=CASE WHEN captured_at IS NULL THEN NULL ELSE substr(captured_at,1,10) END,
+         location_group=CASE WHEN latitude IS NULL OR longitude IS NULL THEN NULL ELSE printf('%.2f, %.2f',latitude,longitude) END,
+         similarity_group=NULL",
+        [],
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT id,captured_at,perceptual_hash FROM photo_entries
+         WHERE is_missing=0 AND captured_at IS NOT NULL AND perceptual_hash IS NOT NULL
+         ORDER BY captured_at,id",
+    )?;
+    let photos = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut parent: Vec<usize> = (0..photos.len()).collect();
+    fn root(parent: &mut [usize], mut value: usize) -> usize {
+        while parent[value] != value {
+            parent[value] = parent[parent[value]];
+            value = parent[value];
+        }
+        value
+    }
+    for current in 0..photos.len() {
+        let Some(current_time) = timestamp_seconds(&photos[current].1) else {
+            continue;
+        };
+        for previous in (0..current).rev() {
+            let Some(previous_time) = timestamp_seconds(&photos[previous].1) else {
+                continue;
+            };
+            if current_time - previous_time > 10 * 60 {
+                break;
+            }
+            if (photos[current].2 ^ photos[previous].2).count_ones() <= 8 {
+                let current_root = root(&mut parent, current);
+                let previous_root = root(&mut parent, previous);
+                if current_root != previous_root {
+                    parent[current_root] = previous_root;
+                }
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<i64>> = BTreeMap::new();
+    for (index, photo) in photos.iter().enumerate() {
+        let group_root = root(&mut parent, index);
+        groups.entry(group_root).or_default().push(photo.0);
+    }
+    let mut group_number = 0;
+    for ids in groups.values().filter(|ids| ids.len() > 1) {
+        group_number += 1;
+        let label = format!("相似组 {group_number:03}");
+        for id in ids {
+            transaction.execute(
+                "UPDATE photo_entries SET similarity_group=?1 WHERE id=?2",
+                params![label, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
     scan_project_with_progress(database_path, Arc::new(|_| {}))
@@ -523,7 +763,7 @@ pub fn scan_project_with_progress(
         return Err(AppError::InvalidPhotoRoot(root));
     }
     let (groups, mut warnings, discovered_files) = collect_groups(&root, &progress)?;
-    let thumbnails = generate_thumbnails(&groups, &progress);
+    let artifacts = generate_artifacts(&groups, &progress);
     let scan_complete = warnings.is_empty();
     let mut connection = db::connect(database_path)?;
     connection.execute("INSERT INTO scan_runs(status) VALUES('running')", [])?;
@@ -543,7 +783,7 @@ pub fn scan_project_with_progress(
 
     let group_total = groups.len();
     report(&progress, "database", 0, group_total, "正在写入项目数据库");
-    for (index, (group, thumbnail_result)) in groups.into_iter().zip(thumbnails).enumerate() {
+    for (index, (group, artifact_result)) in groups.into_iter().zip(artifacts).enumerate() {
         let status = classify_group(&group.files);
         match status {
             "complete" => summary.complete += 1,
@@ -618,13 +858,23 @@ pub fn scan_project_with_progress(
             }
         }
 
-        match thumbnail_result {
-            Ok(Some(bytes)) => {
+        match artifact_result {
+            Ok(artifact) => {
+                if let Some(bytes) = artifact.thumbnail {
+                    transaction.execute(
+                        "UPDATE photo_entries SET thumbnail_blob=?1,thumbnail_mime='image/jpeg' WHERE id=?2",
+                        params![bytes,entry_id])?;
+                }
+                let metadata = artifact.metadata;
                 transaction.execute(
-                    "UPDATE photo_entries SET thumbnail_blob=?1,thumbnail_mime='image/jpeg' WHERE id=?2",
-                    params![bytes,entry_id])?;
+                    "UPDATE photo_entries SET pixel_width=?1,pixel_height=?2,orientation=?3,captured_at=?4,
+                     camera_make=?5,camera_model=?6,lens_model=?7,exposure_time=?8,aperture=?9,iso=?10,
+                     focal_length=?11,latitude=?12,longitude=?13,perceptual_hash=?14 WHERE id=?15",
+                    params![metadata.pixel_width,metadata.pixel_height,metadata.orientation,metadata.captured_at,
+                        metadata.camera_make,metadata.camera_model,metadata.lens_model,metadata.exposure_time,
+                        metadata.aperture,metadata.iso,metadata.focal_length,metadata.latitude,metadata.longitude,
+                        metadata.perceptual_hash.map(|value| value as i64),entry_id])?;
             }
-            Ok(None) => {}
             Err(error) => warnings.push(error),
         }
         let done = index + 1;
@@ -648,6 +898,7 @@ pub fn scan_project_with_progress(
     for id in touched_entries {
         refresh_entry_status(&transaction, id)?;
     }
+    refresh_smart_groups(&transaction)?;
     transaction.execute(
         "UPDATE scan_runs SET status='completed',completed_at=CURRENT_TIMESTAMP,error_message=?1 WHERE id=?2",
         params![if warnings.is_empty() { None } else { Some(warnings.join("\n")) }, scan_id])?;
@@ -710,6 +961,16 @@ mod tests {
             .unwrap();
         let c = quick_fingerprint(&path, 12).unwrap();
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn exif_dates_convert_to_comparable_seconds() {
+        assert_eq!(
+            timestamp_seconds("2026-10-05 12:00:30").unwrap()
+                - timestamp_seconds("2026-10-05 11:59:30").unwrap(),
+            60
+        );
+        assert!(timestamp_seconds("not a date").is_none());
     }
 
     #[test]
@@ -804,6 +1065,18 @@ mod tests {
         assert_eq!(database_counts.0 as usize, summary.total_groups);
         assert_eq!(database_counts.1 as usize, summary.discovered_files);
         assert!(summary.total_groups > 0);
+        let metadata_counts: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT SUM(captured_at IS NOT NULL),SUM(latitude IS NOT NULL),
+                 SUM(date_group IS NOT NULL),SUM(similarity_group IS NOT NULL) FROM photo_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(
+            metadata_counts.0 > 0,
+            "real JPEGs should expose capture dates"
+        );
 
         let photo_id: i64 = connection
             .query_row(
@@ -821,7 +1094,7 @@ mod tests {
         assert_eq!(exported.succeeded, 1);
         assert_eq!(exported.failed, 0);
         println!(
-            "real scan: files={}, groups={}, complete={}, missing_jpeg={}, missing_raw={}, conflicts={}, warnings={}, elapsed={:?}",
+            "real scan: files={}, groups={}, complete={}, missing_jpeg={}, missing_raw={}, conflicts={}, warnings={}, exif_dates={}, gps={}, date_groups={}, similar_photos={}, elapsed={:?}",
             summary.discovered_files,
             summary.total_groups,
             summary.complete,
@@ -829,6 +1102,10 @@ mod tests {
             summary.missing_raw,
             summary.conflicts,
             summary.warnings.len(),
+            metadata_counts.0,
+            metadata_counts.1,
+            metadata_counts.2,
+            metadata_counts.3,
             started.elapsed()
         );
     }

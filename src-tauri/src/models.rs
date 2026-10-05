@@ -34,6 +34,22 @@ pub struct PhotoEntry {
     pub raw_relative_path: Option<String>,
     pub modified_time: Option<f64>,
     pub thumbnail_data_url: Option<String>,
+    pub pixel_width: Option<u32>,
+    pub pixel_height: Option<u32>,
+    pub orientation: Option<u16>,
+    pub captured_at: Option<String>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens_model: Option<String>,
+    pub exposure_time: Option<String>,
+    pub aperture: Option<String>,
+    pub iso: Option<u32>,
+    pub focal_length: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub date_group: Option<String>,
+    pub location_group: Option<String>,
+    pub similarity_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
