@@ -1,1 +1,9 @@
-# empty file
+node_modules/
+dist/
+src-tauri/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+.idea/
+.vscode/
