@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProjectInfo {
     pub database_path: String,
     pub photo_root: String,
+    pub photo_root_available: bool,
     pub sort_field: String,
     pub sort_direction: String,
 }

@@ -154,15 +154,28 @@ pub fn project_info(connection: &Connection, database_path: &Path) -> AppResult<
             "SELECT photo_root, sort_field, sort_direction FROM project_settings WHERE id = 1",
             [],
             |row| {
+                let photo_root: String = row.get(0)?;
                 Ok(ProjectInfo {
                     database_path: database_path.to_string_lossy().into_owned(),
-                    photo_root: row.get(0)?,
+                    photo_root_available: Path::new(&photo_root).is_dir(),
+                    photo_root,
                     sort_field: row.get(1)?,
                     sort_direction: row.get(2)?,
                 })
             },
         )
         .map_err(AppError::from)
+}
+
+pub fn set_photo_root(connection: &Connection, photo_root: &Path) -> AppResult<()> {
+    if !photo_root.is_dir() {
+        return Err(AppError::InvalidPhotoRoot(photo_root.to_path_buf()));
+    }
+    connection.execute(
+        "UPDATE project_settings SET photo_root=?1,updated_at=CURRENT_TIMESTAMP WHERE id=1",
+        [photo_root.to_string_lossy().as_ref()],
+    )?;
+    Ok(())
 }
 
 pub fn validate_tag_name(name: &str) -> AppResult<String> {

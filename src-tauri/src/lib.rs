@@ -15,6 +15,7 @@ pub fn run() {
             commands::open_project,
             commands::get_snapshot,
             commands::scan_project,
+            commands::get_photo_preview,
             commands::create_tag,
             commands::rename_tag,
             commands::inspect_tag_delete,
@@ -23,6 +24,7 @@ pub fn run() {
             commands::save_sort,
             commands::delete_missing,
             commands::checkpoint,
+            commands::set_photo_root,
             commands::plan_export,
             commands::export_photos,
         ])

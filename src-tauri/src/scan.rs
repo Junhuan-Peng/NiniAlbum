@@ -6,6 +6,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{codecs::jpeg::JpegEncoder, ImageReader};
 use rusqlite::{params, OptionalExtension, Transaction};
 use walkdir::WalkDir;
@@ -208,6 +209,23 @@ fn thumbnail(path: &Path) -> AppResult<Vec<u8>> {
     let mut bytes = Vec::new();
     JpegEncoder::new_with_quality(&mut bytes, 80).encode_image(&thumb)?;
     Ok(bytes)
+}
+
+pub fn photo_preview(database_path: &Path, photo_id: i64) -> AppResult<String> {
+    let connection = db::connect(database_path)?;
+    let (root, relative): (String, String) = connection.query_row(
+        "SELECT s.photo_root,f.relative_path FROM project_settings s,photo_files f
+         WHERE f.photo_entry_id=?1 AND f.file_kind='jpeg' AND f.is_missing=0 ORDER BY f.id LIMIT 1",
+        [photo_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let image = ImageReader::open(PathBuf::from(root).join(relative))?
+        .with_guessed_format()?
+        .decode()?;
+    let preview = image.thumbnail(2400, 2400);
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 88).encode_image(&preview)?;
+    Ok(format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)))
 }
 
 fn destination_entry(
@@ -472,5 +490,53 @@ mod tests {
             .unwrap();
         let c = quick_fingerprint(&path, 12).unwrap();
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn recursive_rescan_tracks_moves_and_preserves_tags() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("photos");
+        let original = root.join("day-one");
+        std::fs::create_dir_all(&original).unwrap();
+        let jpeg = original.join("DSC0001.JPG");
+        let raw = original.join("dsc0001.arw");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([30, 60, 90]))
+            .save(&jpeg)
+            .unwrap();
+        File::create(&raw)
+            .unwrap()
+            .write_all(b"raw payload")
+            .unwrap();
+        let database = workspace.path().join("project.sqlite");
+        db::create_project(&database, &root).unwrap();
+
+        let first = scan_project(&database).unwrap();
+        assert_eq!(first.complete, 1);
+        let connection = db::connect(&database).unwrap();
+        let entry_id: i64 = connection
+            .query_row("SELECT id FROM photo_entries", [], |row| row.get(0))
+            .unwrap();
+        let tag_id = db::create_tag(&connection, None, "旅行").unwrap();
+        db::assign_tag(&connection, entry_id, Some(tag_id)).unwrap();
+        drop(connection);
+
+        let moved = root.join("day-two");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::rename(&jpeg, moved.join("DSC0001.JPG")).unwrap();
+        std::fs::rename(&raw, moved.join("dsc0001.arw")).unwrap();
+        let second = scan_project(&database).unwrap();
+        assert_eq!(second.moved_files, 2);
+        let connection = db::connect(&database).unwrap();
+        let state: (i64, Option<i64>, String, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),MAX(tag_id),MAX(relative_dir),SUM(is_missing) FROM photo_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, 1);
+        assert_eq!(state.1, Some(tag_id));
+        assert_eq!(PathBuf::from(state.2), PathBuf::from("day-two"));
+        assert_eq!(state.3, 0);
     }
 }
