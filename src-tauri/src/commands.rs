@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     db::{self, AppState},
@@ -46,11 +46,19 @@ pub fn get_snapshot(
 }
 
 #[tauri::command]
-pub async fn scan_project(state: State<'_, AppState>) -> Result<ScanSummary, String> {
+pub async fn scan_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ScanSummary, String> {
     let path = state.project_path().command()?;
-    tauri::async_runtime::spawn_blocking(move || scan::scan_project(&path).command())
-        .await
-        .map_err(|error| error.to_string())?
+    let progress = std::sync::Arc::new(move |update| {
+        let _ = app.emit("scan-progress", update);
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        scan::scan_project_with_progress(&path, progress).command()
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

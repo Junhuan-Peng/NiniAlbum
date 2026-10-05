@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import { open, save } from '@tauri-apps/plugin-dialog';
   import Button from './lib/components/ui/Button.svelte';
   import Modal from './lib/components/ui/Modal.svelte';
@@ -7,7 +8,7 @@
   import TagBranch from './lib/components/TagBranch.svelte';
   import { api } from './lib/api';
   import { toast } from './lib/toast';
-  import type { DeleteImpact, ExportPlan, PhotoEntry, PhotoFilter, ProjectSnapshot, SortDirection, SortField, TagNode } from './lib/types';
+  import type { DeleteImpact, ExportPlan, PhotoEntry, PhotoFilter, ProjectSnapshot, ScanProgress, SortDirection, SortField, TagNode } from './lib/types';
 
   let snapshot: ProjectSnapshot | null = null;
   let selectedIndex = 0;
@@ -19,6 +20,7 @@
   let busyLabel = '';
   let previewData: string | null = null;
   let previewLoading = false;
+  let scanProgress: ScanProgress | null = null;
   let zoom = 1;
   let leftWidth = 248;
   let rightWidth = 310;
@@ -31,6 +33,9 @@
   $: currentPhoto = photos[selectedIndex] ?? null;
   $: roots = (snapshot?.tags ?? []).filter((tag) => tag.parentId === null);
   $: selectedTag = snapshot?.tags.find((tag) => tag.id === selectedTagId) ?? null;
+  $: scanPercent = scanProgress && scanProgress.total > 0
+    ? Math.min(100, Math.round((scanProgress.completed / scanProgress.total) * 100))
+    : 0;
 
   const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -77,10 +82,15 @@
   }
 
   async function scanPhotos() {
-    await runBusy('正在递归扫描和生成缩略图…', async () => {
-      const result = await api.scan(); await refresh();
-      toast(`扫描完成：${result.totalGroups} 组，完整 ${result.complete}，缺配对 ${result.missingJpeg + result.missingRaw}，冲突 ${result.conflicts}`, result.warnings.length ? 'default' : 'success', 6000);
-    });
+    scanProgress = { phase: 'discovering', completed: 0, total: 0, message: '正在递归发现照片文件' };
+    try {
+      await runBusy('正在扫描…', async () => {
+        const result = await api.scan(); await refresh();
+        toast(`扫描完成：${result.totalGroups} 组，完整 ${result.complete}，缺配对 ${result.missingJpeg + result.missingRaw}，冲突 ${result.conflicts}`, result.warnings.length ? 'default' : 'success', 6000);
+      });
+    } finally {
+      scanProgress = null;
+    }
   }
 
   async function relocatePhotoRoot() {
@@ -205,6 +215,19 @@
   function focusOnMount(node: HTMLElement) {
     queueMicrotask(() => node.focus());
   }
+
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    listen<ScanProgress>('scan-progress', ({ payload }) => {
+      if (scanProgress?.phase === payload.phase && scanProgress.message === payload.message
+        && payload.completed < scanProgress.completed) return;
+      scanProgress = payload;
+      busyLabel = payload.total > 0
+        ? `${payload.message} ${payload.completed}/${payload.total}`
+        : payload.message;
+    }).then((dispose) => { unlisten = dispose; }).catch(() => { /* Browser-only preview has no Tauri event bridge. */ });
+    return () => unlisten?.();
+  });
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -217,6 +240,19 @@
     <Button size="sm" disabled={!snapshot || busy} on:click={scanPhotos}>递归扫描</Button><Button size="sm" variant="ghost" disabled={!snapshot || busy} on:click={relocatePhotoRoot}>照片目录</Button><Button size="sm" variant="primary" disabled={!snapshot || busy} on:click={prepareExport}>批量导出</Button><Button size="sm" variant="ghost" disabled={!snapshot} on:click={syncProject}>同步</Button>
     <div class="ml-auto flex items-center gap-2 text-xs text-muted">{#if busy}<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-r-transparent"></span><span>{busyLabel}</span>{/if}</div>
   </header>
+
+  {#if busy && scanProgress}
+    <div class="relative flex h-8 shrink-0 items-center justify-between overflow-hidden border-b border-border bg-[#121417] px-3 text-[11px] text-muted">
+      <div
+        class:animate-pulse={scanProgress.total === 0}
+        class="absolute inset-y-0 left-0 bg-accent/10 transition-[width] duration-200"
+        style={`width:${scanProgress.total > 0 ? scanPercent : 100}%`}
+      ></div>
+      <span class="relative">{scanProgress.message}</span>
+      <span class="relative tabular-nums">{scanProgress.total > 0 ? `${scanProgress.completed} / ${scanProgress.total} · ${scanPercent}%` : `${scanProgress.completed} 个文件`}</span>
+      <div class="absolute inset-x-0 bottom-0 h-0.5 bg-black/30"><div class="h-full bg-accent transition-[width] duration-200" class:animate-pulse={scanProgress.total === 0} style={`width:${scanProgress.total > 0 ? scanPercent : 100}%`}></div></div>
+    </div>
+  {/if}
 
   {#if snapshot}
     <section class="grid min-h-0 flex-1" style={`grid-template-columns:${leftWidth}px 5px minmax(0,1fr) 5px ${rightWidth}px`}>

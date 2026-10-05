@@ -41,6 +41,8 @@ export interface ScanSummary {
   missingRaw: number; conflicts: number; movedFiles: number; warnings: string[];
 }
 
+export interface ScanProgress { phase: 'discovering' | 'fingerprinting' | 'thumbnails' | 'database' | 'complete'; completed: number; total: number; message: string; }
+
 export interface DeleteImpact { tagCount: number; affectedPhotos: number; }
 export interface ExportPlan { eligible: number; conflicts: number; skippedUntagged: number; skippedIncomplete: number; skippedMissing: number; }
 export interface ExportFailure { photoId: number; name: string; reason: string; }

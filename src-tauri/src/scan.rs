@@ -3,6 +3,10 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::UNIX_EPOCH,
 };
 
@@ -15,7 +19,7 @@ use walkdir::WalkDir;
 use crate::{
     db,
     error::{AppError, AppResult},
-    models::ScanSummary,
+    models::{ScanProgress, ScanSummary},
 };
 
 const FINGERPRINT_CHUNK: usize = 1024 * 1024;
@@ -58,6 +62,27 @@ struct ScannedGroup {
     key: GroupKey,
     display_base_name: String,
     files: Vec<ScannedFile>,
+}
+
+#[derive(Debug)]
+struct FileCandidate {
+    absolute_path: PathBuf,
+    relative_path: String,
+    original_file_name: String,
+    kind: FileKind,
+    key: GroupKey,
+    display_base_name: String,
+}
+
+pub type ProgressCallback = Arc<dyn Fn(ScanProgress) + Send + Sync>;
+
+fn report(progress: &ProgressCallback, phase: &str, completed: usize, total: usize, message: &str) {
+    progress(ScanProgress {
+        phase: phase.into(),
+        completed,
+        total,
+        message: message.into(),
+    });
 }
 
 pub fn normalize_pairing_key(stem: &str) -> String {
@@ -134,10 +159,13 @@ pub fn content_hash(path: &Path) -> AppResult<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn collect_groups(root: &Path) -> AppResult<(Vec<ScannedGroup>, Vec<String>, usize)> {
-    let mut groups: BTreeMap<GroupKey, ScannedGroup> = BTreeMap::new();
+fn collect_groups(
+    root: &Path,
+    progress: &ProgressCallback,
+) -> AppResult<(Vec<ScannedGroup>, Vec<String>, usize)> {
+    let mut candidates = Vec::new();
     let mut warnings = Vec::new();
-    let mut discovered = 0;
+    report(progress, "discovering", 0, 0, "正在递归发现照片文件");
     for item in WalkDir::new(root).follow_links(false) {
         let entry = match item {
             Ok(entry) => entry,
@@ -163,46 +191,100 @@ fn collect_groups(root: &Path) -> AppResult<(Vec<ScannedGroup>, Vec<String>, usi
         else {
             continue;
         };
-        let relative_dir = relative.parent().unwrap_or_else(|| Path::new(""));
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                warnings.push(format!("{}: {error}", entry.path().display()));
-                continue;
-            }
-        };
-        let fingerprint = match quick_fingerprint(entry.path(), metadata.len()) {
-            Ok(value) => value,
-            Err(error) => {
-                warnings.push(format!("{}: {error}", entry.path().display()));
-                continue;
-            }
-        };
         let key = GroupKey {
-            relative_dir: relative_dir.to_string_lossy().into_owned(),
+            relative_dir: relative
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .into_owned(),
             pairing_key: normalize_pairing_key(&stem),
         };
-        let file = ScannedFile {
+        candidates.push(FileCandidate {
             absolute_path: entry.path().to_path_buf(),
             relative_path: relative.to_string_lossy().into_owned(),
             original_file_name: entry.file_name().to_string_lossy().into_owned(),
             kind,
-            size: metadata.len(),
-            modified_time: modified_time(&metadata),
-            quick_fingerprint: fingerprint,
-            content_hash: None,
-        };
-        groups
-            .entry(key.clone())
-            .or_insert_with(|| ScannedGroup {
-                key,
-                display_base_name: stem.clone(),
-                files: Vec::new(),
-            })
-            .files
-            .push(file);
-        discovered += 1;
+            key,
+            display_base_name: stem,
+        });
+        if candidates.len() % 200 == 0 {
+            report(
+                progress,
+                "discovering",
+                candidates.len(),
+                0,
+                "正在递归发现照片文件",
+            );
+        }
     }
+
+    let total = candidates.len();
+    report(progress, "fingerprinting", 0, total, "正在并发读取文件指纹");
+    let completed = AtomicUsize::new(0);
+    let fingerprint_results = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|index| format!("fingerprint-{index}"))
+        .build()
+        .expect("failed to create fingerprint thread pool")
+        .install(|| {
+            candidates
+                .into_par_iter()
+                .map(|candidate| {
+                    let result = (|| {
+                        let metadata = std::fs::metadata(&candidate.absolute_path)?;
+                        let fingerprint =
+                            quick_fingerprint(&candidate.absolute_path, metadata.len())?;
+                        Ok::<_, AppError>((
+                            candidate.key,
+                            candidate.display_base_name,
+                            ScannedFile {
+                                absolute_path: candidate.absolute_path,
+                                relative_path: candidate.relative_path,
+                                original_file_name: candidate.original_file_name,
+                                kind: candidate.kind,
+                                size: metadata.len(),
+                                modified_time: modified_time(&metadata),
+                                quick_fingerprint: fingerprint,
+                                content_hash: None,
+                            },
+                        ))
+                    })()
+                    .map_err(|error| error.to_string());
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done.is_multiple_of(20) || done == total {
+                        report(
+                            progress,
+                            "fingerprinting",
+                            done,
+                            total,
+                            "正在并发读取文件指纹",
+                        );
+                    }
+                    result
+                })
+                .collect::<Vec<_>>()
+        });
+
+    let mut groups: BTreeMap<GroupKey, ScannedGroup> = BTreeMap::new();
+    let mut discovered = 0;
+    for result in fingerprint_results {
+        match result {
+            Ok((key, display_base_name, file)) => {
+                groups
+                    .entry(key.clone())
+                    .or_insert_with(|| ScannedGroup {
+                        key,
+                        display_base_name,
+                        files: Vec::new(),
+                    })
+                    .files
+                    .push(file);
+                discovered += 1;
+            }
+            Err(error) => warnings.push(error),
+        }
+    }
+
     let mut groups: Vec<_> = groups.into_values().collect();
     let mut fingerprint_counts = BTreeMap::new();
     for file in groups.iter().flat_map(|group| &group.files) {
@@ -214,21 +296,65 @@ fn collect_groups(root: &Path) -> AppResult<(Vec<ScannedGroup>, Vec<String>, usi
             ))
             .or_insert(0_usize) += 1;
     }
-    for file in groups.iter_mut().flat_map(|group| &mut group.files) {
-        let key = (
-            file.kind.as_str(),
-            file.size,
-            file.quick_fingerprint.clone(),
+    let duplicate_total = groups
+        .iter()
+        .flat_map(|group| &group.files)
+        .filter(|file| {
+            fingerprint_counts
+                .get(&(
+                    file.kind.as_str(),
+                    file.size,
+                    file.quick_fingerprint.clone(),
+                ))
+                .copied()
+                .unwrap_or(0)
+                > 1
+        })
+        .count();
+    if duplicate_total > 0 {
+        report(
+            progress,
+            "fingerprinting",
+            0,
+            duplicate_total,
+            "正在确认重复指纹",
         );
-        if fingerprint_counts.get(&key).copied().unwrap_or(0) > 1 {
-            match content_hash(&file.absolute_path) {
-                Ok(hash) => file.content_hash = Some(hash),
-                Err(error) => warnings.push(format!(
-                    "完整指纹生成失败 {}：{error}",
-                    file.absolute_path.display()
-                )),
+        let duplicate_done = AtomicUsize::new(0);
+        let hash_errors = Mutex::new(Vec::new());
+        groups.par_iter_mut().for_each(|group| {
+            for file in &mut group.files {
+                let key = (
+                    file.kind.as_str(),
+                    file.size,
+                    file.quick_fingerprint.clone(),
+                );
+                if fingerprint_counts.get(&key).copied().unwrap_or(0) > 1 {
+                    match content_hash(&file.absolute_path) {
+                        Ok(hash) => file.content_hash = Some(hash),
+                        Err(error) => {
+                            hash_errors
+                                .lock()
+                                .expect("hash error lock poisoned")
+                                .push(format!(
+                                    "完整指纹生成失败 {}：{error}",
+                                    file.absolute_path.display()
+                                ))
+                        }
+                    }
+                    let done = duplicate_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done.is_multiple_of(10) || done == duplicate_total {
+                        report(
+                            progress,
+                            "fingerprinting",
+                            done,
+                            duplicate_total,
+                            "正在确认重复指纹",
+                        );
+                    }
+                }
             }
-        }
+        });
+        warnings.extend(hash_errors.into_inner().expect("hash error lock poisoned"));
     }
     Ok((groups, warnings, discovered))
 }
@@ -241,20 +367,39 @@ fn thumbnail(path: &Path) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn generate_thumbnails(groups: &[ScannedGroup]) -> Vec<Result<Option<Vec<u8>>, String>> {
+fn generate_thumbnails(
+    groups: &[ScannedGroup],
+    progress: &ProgressCallback,
+) -> Vec<Result<Option<Vec<u8>>, String>> {
+    let total = groups.len();
+    let completed = AtomicUsize::new(0);
+    report(progress, "thumbnails", 0, total, "正在并发生成 JPEG 缩略图");
     let work = || {
         groups
             .par_iter()
             .map(|group| {
-                if classify_group(&group.files) == "conflict" {
-                    return Ok(None);
-                }
-                let Some(jpeg) = group.files.iter().find(|file| file.kind == FileKind::Jpeg) else {
-                    return Ok(None);
+                let result = if classify_group(&group.files) == "conflict" {
+                    Ok(None)
+                } else if let Some(jpeg) =
+                    group.files.iter().find(|file| file.kind == FileKind::Jpeg)
+                {
+                    thumbnail(&jpeg.absolute_path).map(Some).map_err(|error| {
+                        format!("缩略图生成失败 {}：{error}", jpeg.absolute_path.display())
+                    })
+                } else {
+                    Ok(None)
                 };
-                thumbnail(&jpeg.absolute_path).map(Some).map_err(|error| {
-                    format!("缩略图生成失败 {}：{error}", jpeg.absolute_path.display())
-                })
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done.is_multiple_of(10) || done == total {
+                    report(
+                        progress,
+                        "thumbnails",
+                        done,
+                        total,
+                        "正在并发生成 JPEG 缩略图",
+                    );
+                }
+                result
             })
             .collect()
     };
@@ -358,7 +503,15 @@ fn refresh_entry_status(transaction: &Transaction<'_>, entry_id: i64) -> AppResu
     Ok(())
 }
 
+#[cfg(test)]
 pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
+    scan_project_with_progress(database_path, Arc::new(|_| {}))
+}
+
+pub fn scan_project_with_progress(
+    database_path: &Path,
+    progress: ProgressCallback,
+) -> AppResult<ScanSummary> {
     let connection = db::connect(database_path)?;
     let root: String = connection.query_row(
         "SELECT photo_root FROM project_settings WHERE id=1",
@@ -369,8 +522,8 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
     if !root.is_dir() {
         return Err(AppError::InvalidPhotoRoot(root));
     }
-    let (groups, mut warnings, discovered_files) = collect_groups(&root)?;
-    let thumbnails = generate_thumbnails(&groups);
+    let (groups, mut warnings, discovered_files) = collect_groups(&root, &progress)?;
+    let thumbnails = generate_thumbnails(&groups, &progress);
     let scan_complete = warnings.is_empty();
     let mut connection = db::connect(database_path)?;
     connection.execute("INSERT INTO scan_runs(status) VALUES('running')", [])?;
@@ -388,7 +541,9 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
     };
     let mut touched_entries = BTreeSet::new();
 
-    for (group, thumbnail_result) in groups.into_iter().zip(thumbnails) {
+    let group_total = groups.len();
+    report(&progress, "database", 0, group_total, "正在写入项目数据库");
+    for (index, (group, thumbnail_result)) in groups.into_iter().zip(thumbnails).enumerate() {
         let status = classify_group(&group.files);
         match status {
             "complete" => summary.complete += 1,
@@ -472,6 +627,16 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
             Ok(None) => {}
             Err(error) => warnings.push(error),
         }
+        let done = index + 1;
+        if done.is_multiple_of(25) || done == group_total {
+            report(
+                &progress,
+                "database",
+                done,
+                group_total,
+                "正在写入项目数据库",
+            );
+        }
     }
 
     if scan_complete {
@@ -488,6 +653,7 @@ pub fn scan_project(database_path: &Path) -> AppResult<ScanSummary> {
         params![if warnings.is_empty() { None } else { Some(warnings.join("\n")) }, scan_id])?;
     transaction.commit()?;
     summary.warnings = warnings;
+    report(&progress, "complete", 1, 1, "扫描完成");
     Ok(summary)
 }
 
@@ -564,8 +730,27 @@ mod tests {
         let database = workspace.path().join("project.sqlite");
         db::create_project(&database, &root).unwrap();
 
-        let first = scan_project(&database).unwrap();
+        let progress_events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&progress_events);
+        let first = scan_project_with_progress(
+            &database,
+            Arc::new(move |progress| {
+                captured.lock().unwrap().push(progress);
+            }),
+        )
+        .unwrap();
         assert_eq!(first.complete, 1);
+        let phases: BTreeSet<_> = progress_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|progress| progress.phase.clone())
+            .collect();
+        assert!(phases.contains("discovering"));
+        assert!(phases.contains("fingerprinting"));
+        assert!(phases.contains("thumbnails"));
+        assert!(phases.contains("database"));
+        assert!(phases.contains("complete"));
         let connection = db::connect(&database).unwrap();
         let entry_id: i64 = connection
             .query_row("SELECT id FROM photo_entries", [], |row| row.get(0))

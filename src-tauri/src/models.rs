@@ -88,6 +88,15 @@ pub struct ScanSummary {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    pub phase: String,
+    pub completed: usize,
+    pub total: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteImpact {
     pub tag_count: i64,
     pub affected_photos: i64,
