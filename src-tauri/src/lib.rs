@@ -1,3 +1,4 @@
+mod baidu;
 mod commands;
 mod db;
 mod error;
@@ -36,6 +37,15 @@ pub fn run() {
             commands::checkpoint,
             commands::plan_export,
             commands::export_photos,
+            commands::baidu_status,
+            commands::configure_baidu,
+            commands::open_baidu_authorization,
+            commands::authorize_baidu,
+            commands::disconnect_baidu,
+            commands::list_baidu_folders,
+            commands::create_baidu_folder,
+            commands::plan_baidu_export,
+            commands::export_to_baidu,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Nini Albums");

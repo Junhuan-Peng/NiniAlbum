@@ -1,0 +1,572 @@
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::Read,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use keyring::Entry;
+use reqwest::blocking::{multipart, Client};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{
+    error::{AppError, AppResult},
+    export,
+    models::{
+        BaiduDirectoryListing, BaiduFolder, BaiduStatus, ExportFailure, ExportPlan, ExportSummary,
+    },
+};
+
+const SERVICE: &str = "com.nini-albums.baidu-netdisk";
+const CREDENTIAL_ACCOUNT: &str = "app-credentials";
+const TOKEN_ACCOUNT: &str = "oauth-token";
+const APP_ROOT: &str = "/apps/尼尼相册";
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Credentials {
+    app_key: String,
+    secret_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TokenData {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: u64,
+}
+
+fn invalid(message: impl Into<String>) -> AppError {
+    AppError::InvalidInput(message.into())
+}
+
+fn entry(account: &str) -> AppResult<Entry> {
+    Entry::new(SERVICE, account).map_err(|error| invalid(format!("无法访问系统凭据存储：{error}")))
+}
+
+fn load_json<T: for<'de> Deserialize<'de>>(account: &str) -> AppResult<Option<T>> {
+    let value = match entry(account)?.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(error) => return Err(invalid(format!("无法读取系统凭据：{error}"))),
+    };
+    serde_json::from_str(&value)
+        .map(Some)
+        .map_err(|error| invalid(format!("系统凭据格式无效：{error}")))
+}
+
+fn save_json<T: Serialize>(account: &str, value: &T) -> AppResult<()> {
+    let value = serde_json::to_string(value).map_err(|error| invalid(error.to_string()))?;
+    entry(account)?
+        .set_password(&value)
+        .map_err(|error| invalid(format!("无法写入系统凭据：{error}")))
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn credentials() -> AppResult<Credentials> {
+    load_json(CREDENTIAL_ACCOUNT)?
+        .ok_or_else(|| invalid("请先在设置中填写百度网盘 AppKey 和 SecretKey"))
+}
+
+pub fn configure(app_key: String, secret_key: String) -> AppResult<()> {
+    let app_key = app_key.trim().to_owned();
+    let secret_key = secret_key.trim().to_owned();
+    if app_key.is_empty() || secret_key.is_empty() {
+        return Err(invalid("AppKey 和 SecretKey 不能为空"));
+    }
+    save_json(
+        CREDENTIAL_ACCOUNT,
+        &Credentials {
+            app_key,
+            secret_key,
+        },
+    )
+}
+
+pub fn status() -> AppResult<BaiduStatus> {
+    Ok(BaiduStatus {
+        configured: load_json::<Credentials>(CREDENTIAL_ACCOUNT)?.is_some(),
+        authorized: load_json::<TokenData>(TOKEN_ACCOUNT)?.is_some(),
+    })
+}
+
+pub fn authorization_url() -> AppResult<String> {
+    let config = credentials()?;
+    let mut url = reqwest::Url::parse("https://openapi.baidu.com/oauth/2.0/authorize")
+        .map_err(|error| invalid(error.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &config.app_key)
+        .append_pair("redirect_uri", "oob")
+        .append_pair("scope", "basic,netdisk")
+        .append_pair("display", "popup")
+        .append_pair("state", "nini_albums_export");
+    Ok(url.into())
+}
+
+pub fn open_authorization() -> AppResult<String> {
+    let url = authorization_url()?;
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(&url).status()?;
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .status()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(&url).status()?;
+    if !status.success() {
+        return Err(invalid("无法打开系统浏览器，请复制授权链接后手动打开"));
+    }
+    Ok(url)
+}
+
+pub fn exchange_code(code: String) -> AppResult<()> {
+    let config = credentials()?;
+    let response = Client::new()
+        .get("https://openapi.baidu.com/oauth/2.0/token")
+        .query(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.trim()),
+            ("client_id", config.app_key.as_str()),
+            ("client_secret", config.secret_key.as_str()),
+            ("redirect_uri", "oob"),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let token: TokenResponse = response_json(response)?;
+    save_json(
+        TOKEN_ACCOUNT,
+        &TokenData {
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            expires_at: now().saturating_add(token.expires_in),
+        },
+    )
+}
+
+pub fn disconnect() -> AppResult<()> {
+    match entry(TOKEN_ACCOUNT)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(invalid(format!("无法删除授权信息：{error}"))),
+    }
+}
+
+fn access_token() -> AppResult<String> {
+    let mut token: TokenData = load_json(TOKEN_ACCOUNT)?
+        .ok_or_else(|| invalid("百度网盘尚未授权，请先在设置中完成授权"))?;
+    if token.expires_at > now().saturating_add(300) {
+        return Ok(token.access_token);
+    }
+    let config = credentials()?;
+    let response = Client::new()
+        .get("https://openapi.baidu.com/oauth/2.0/token")
+        .query(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", token.refresh_token.as_str()),
+            ("client_id", config.app_key.as_str()),
+            ("client_secret", config.secret_key.as_str()),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let refreshed: TokenResponse = response_json(response)?;
+    token = TokenData {
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token,
+        expires_at: now().saturating_add(refreshed.expires_in),
+    };
+    save_json(TOKEN_ACCOUNT, &token)?;
+    Ok(token.access_token)
+}
+
+fn network_error(error: reqwest::Error) -> AppError {
+    invalid(format!("百度网盘网络请求失败：{error}"))
+}
+
+fn response_json<T: for<'de> Deserialize<'de>>(
+    response: reqwest::blocking::Response,
+) -> AppResult<T> {
+    let status = response.status();
+    let bytes = response.bytes().map_err(network_error)?;
+    if !status.is_success() {
+        return Err(invalid(format!("百度网盘请求失败（HTTP {status}）")));
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        if let Some(code) = value.get("error_code").and_then(Value::as_i64) {
+            let message = value
+                .get("error_description")
+                .or_else(|| value.get("error_msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            return Err(invalid(format!("百度网盘返回错误 {code}：{message}")));
+        }
+        if let Some(errno) = value.get("errno").and_then(Value::as_i64) {
+            if errno != 0 {
+                return Err(invalid(format!("百度网盘返回错误码 {errno}")));
+            }
+        }
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("百度网盘响应无法解析：{error}")))
+}
+
+fn validate_remote_path(path: &str) -> AppResult<()> {
+    if path != APP_ROOT && !path.starts_with(&format!("{APP_ROOT}/")) {
+        return Err(invalid("只能选择“我的应用数据/尼尼相册”内的目录"));
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Err(invalid("云盘目录不能包含 .."));
+    }
+    Ok(())
+}
+
+fn list_entries(token: &str, directory: &str, limit: usize) -> AppResult<Vec<Value>> {
+    validate_remote_path(directory)?;
+    let response = Client::new()
+        .get("https://pan.baidu.com/rest/2.0/xpan/file")
+        .query(&[
+            ("method", "list"),
+            ("access_token", token),
+            ("dir", directory),
+            ("order", "name"),
+            ("start", "0"),
+            ("limit", &limit.to_string()),
+            ("web", "1"),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let value: Value = response_json(response)?;
+    Ok(value
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+pub fn list_folders(directory: Option<String>) -> AppResult<BaiduDirectoryListing> {
+    let directory = directory.unwrap_or_else(|| APP_ROOT.to_owned());
+    validate_remote_path(&directory)?;
+    let token = access_token()?;
+    let entries = list_entries(&token, &directory, 1000)?;
+    let folders = entries
+        .iter()
+        .filter(|entry| entry.get("isdir").and_then(Value::as_i64) == Some(1))
+        .filter_map(|entry| {
+            Some(BaiduFolder {
+                name: entry.get("server_filename")?.as_str()?.to_owned(),
+                path: entry.get("path")?.as_str()?.to_owned(),
+            })
+        })
+        .collect();
+    Ok(BaiduDirectoryListing {
+        current_path: directory,
+        is_empty: entries.is_empty(),
+        folders,
+    })
+}
+
+fn safe_folder_name(name: &str) -> AppResult<&str> {
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|character| character.is_control() || "/\\:*?\"<>|".contains(character))
+    {
+        return Err(invalid("文件夹名称为空或包含非法字符"));
+    }
+    Ok(name)
+}
+
+fn create_directory_with_token(token: &str, path: &str) -> AppResult<()> {
+    validate_remote_path(path)?;
+    let response = Client::new()
+        .post("https://pan.baidu.com/rest/2.0/xpan/file")
+        .query(&[("method", "create"), ("access_token", token)])
+        .form(&[("path", path), ("isdir", "1"), ("rtype", "0")])
+        .send()
+        .map_err(network_error)?;
+    let _: Value = response_json(response)?;
+    Ok(())
+}
+
+pub fn create_folder(parent: String, name: String) -> AppResult<String> {
+    validate_remote_path(&parent)?;
+    let name = safe_folder_name(&name)?;
+    let path = format!("{}/{}", parent.trim_end_matches('/'), name);
+    let token = access_token()?;
+    create_directory_with_token(&token, &path)?;
+    Ok(path)
+}
+
+fn ensure_empty(token: &str, path: &str) -> AppResult<()> {
+    if list_entries(token, path, 1)?.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!("百度网盘导出根目录必须为空：{path}")))
+    }
+}
+
+pub fn plan_export(database_path: &Path, root: &str) -> AppResult<ExportPlan> {
+    let token = access_token()?;
+    ensure_empty(&token, root)?;
+    export::content_plan(database_path)
+}
+
+fn split_file(path: &Path) -> AppResult<(u64, Vec<String>)> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut hashes = Vec::new();
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hashes.push(format!("{:x}", md5::compute(&buffer[..read])));
+    }
+    if hashes.is_empty() {
+        hashes.push(format!("{:x}", md5::compute([])));
+    }
+    Ok((size, hashes))
+}
+
+fn upload_file(token: &str, source: &Path, remote_path: &str, modified_time: f64) -> AppResult<()> {
+    let client = Client::new();
+    let (size, hashes) = split_file(source)?;
+    let block_list = serde_json::to_string(&hashes).map_err(|error| invalid(error.to_string()))?;
+    let response = client
+        .post("https://pan.baidu.com/rest/2.0/xpan/file")
+        .query(&[("method", "precreate"), ("access_token", token)])
+        .form(&[
+            ("path", remote_path.to_owned()),
+            ("size", size.to_string()),
+            ("isdir", "0".to_owned()),
+            ("autoinit", "1".to_owned()),
+            ("rtype", "2".to_owned()),
+            ("block_list", block_list.clone()),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let precreate: Value = response_json(response)?;
+    let upload_id = precreate
+        .get("uploadid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("百度网盘未返回 uploadid"))?;
+
+    let locate = client
+        .get("https://d.pcs.baidu.com/rest/2.0/pcs/file")
+        .query(&[
+            ("method", "locateupload"),
+            ("appid", "250528"),
+            ("access_token", token),
+            ("path", remote_path),
+            ("uploadid", upload_id),
+            ("upload_version", "2.0"),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let locate: Value = response_json(locate)?;
+    let server = locate
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| servers.first())
+        .and_then(|server| server.get("server"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("百度网盘未返回上传服务器"))?;
+    if !server.starts_with("https://") {
+        return Err(invalid("百度网盘返回了不安全的上传地址"));
+    }
+
+    let mut file = File::open(source)?;
+    for part_index in 0..hashes.len() {
+        let mut chunk = vec![0_u8; CHUNK_SIZE];
+        let read = file.read(&mut chunk)?;
+        chunk.truncate(read);
+        let file_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("photo");
+        let form = multipart::Form::new().part(
+            "file",
+            multipart::Part::bytes(chunk).file_name(file_name.to_owned()),
+        );
+        let response = client
+            .post(format!(
+                "{}/rest/2.0/pcs/superfile2",
+                server.trim_end_matches('/')
+            ))
+            .query(&[
+                ("method", "upload"),
+                ("access_token", token),
+                ("type", "tmpfile"),
+                ("path", remote_path),
+                ("uploadid", upload_id),
+                ("partseq", &part_index.to_string()),
+            ])
+            .multipart(form)
+            .send()
+            .map_err(network_error)?;
+        let _: Value = response_json(response)?;
+    }
+
+    let timestamp = modified_time.max(0.0).trunc() as u64;
+    let response = client
+        .post("https://pan.baidu.com/rest/2.0/xpan/file")
+        .query(&[("method", "create"), ("access_token", token)])
+        .form(&[
+            ("path", remote_path.to_owned()),
+            ("size", size.to_string()),
+            ("isdir", "0".to_owned()),
+            ("rtype", "2".to_owned()),
+            ("uploadid", upload_id.to_owned()),
+            ("block_list", block_list),
+            ("local_ctime", timestamp.to_string()),
+            ("local_mtime", timestamp.to_string()),
+        ])
+        .send()
+        .map_err(network_error)?;
+    let _: Value = response_json(response)?;
+    Ok(())
+}
+
+fn renamed_file_names(display_name: &str, names: &[String; 2], index: usize) -> [String; 2] {
+    names.each_ref().map(|name| {
+        let extension = Path::new(name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if extension.is_empty() {
+            format!("{display_name}_{index}")
+        } else {
+            format!("{display_name}_{index}.{extension}")
+        }
+    })
+}
+
+pub fn export_photos<F>(
+    database_path: &Path,
+    root: &str,
+    strategy: &str,
+    mut progress: F,
+) -> AppResult<ExportSummary>
+where
+    F: FnMut(usize, usize, &str),
+{
+    validate_remote_path(root)?;
+    let token = access_token()?;
+    ensure_empty(&token, root)?;
+    let plan = export::content_plan(database_path)?;
+    let manifest = export::manifest(database_path)?;
+    let total_files = manifest.len() * 2;
+    let mut summary = ExportSummary {
+        untagged: plan.untagged,
+        skipped_incomplete: plan.skipped_incomplete,
+        skipped_missing: plan.skipped_missing,
+        skipped_hidden: plan.skipped_hidden,
+        skipped_trashed: plan.skipped_trashed,
+        ..Default::default()
+    };
+    let mut directories = HashSet::from([root.to_owned()]);
+    let mut occupied = HashSet::new();
+    let mut completed_files = 0;
+
+    for item in manifest {
+        let mut directory = root.trim_end_matches('/').to_owned();
+        for component in &item.tag_components {
+            directory.push('/');
+            directory.push_str(component);
+            if directories.insert(directory.clone()) {
+                create_directory_with_token(&token, &directory)?;
+            }
+        }
+        let original_names = [item.files[0].name.clone(), item.files[1].name.clone()];
+        let original_keys = original_names
+            .each_ref()
+            .map(|name| format!("{directory}/{}", name.to_lowercase()));
+        let conflict = original_keys.iter().any(|path| occupied.contains(path));
+        if conflict && strategy == "skip" {
+            summary.skipped += 1;
+            continue;
+        }
+        let names = if conflict && strategy == "rename" {
+            summary.renamed += 1;
+            let mut index = 1;
+            loop {
+                let candidate = renamed_file_names(&item.display_name, &original_names, index);
+                let keys = candidate
+                    .each_ref()
+                    .map(|name| format!("{directory}/{}", name.to_lowercase()));
+                if keys.iter().all(|path| !occupied.contains(path)) {
+                    break candidate;
+                }
+                index += 1;
+            }
+        } else {
+            original_names
+        };
+        occupied.extend(
+            names
+                .each_ref()
+                .map(|name| format!("{directory}/{}", name.to_lowercase())),
+        );
+
+        let mut item_failed = None;
+        for (file, name) in item.files.iter().zip(names.iter()) {
+            progress(completed_files, total_files, name);
+            let remote_path = format!("{directory}/{name}");
+            if let Err(error) = upload_file(&token, &file.source, &remote_path, file.modified_time)
+            {
+                item_failed = Some(error.to_string());
+                break;
+            }
+            completed_files += 1;
+        }
+        if let Some(reason) = item_failed {
+            summary.failed += 1;
+            summary.failures.push(ExportFailure {
+                photo_id: item.photo_id,
+                name: item.display_name,
+                reason,
+            });
+        } else {
+            summary.succeeded += 1;
+        }
+    }
+    progress(completed_files, total_files, "");
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_paths_outside_app_directory() {
+        assert!(validate_remote_path("/apps/尼尼相册/旅行").is_ok());
+        assert!(validate_remote_path("/我的资源").is_err());
+        assert!(validate_remote_path("/apps/尼尼相册/../别处").is_err());
+    }
+
+    #[test]
+    fn renames_a_pair_with_one_suffix() {
+        let result = renamed_file_names("DSC0001", &["a.JPG".into(), "a.ARW".into()], 2);
+        assert_eq!(result, ["DSC0001_2.JPG", "DSC0001_2.ARW"]);
+    }
+}

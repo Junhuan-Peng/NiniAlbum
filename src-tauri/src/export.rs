@@ -24,9 +24,24 @@ struct SourceFile {
 struct ExportItem {
     id: i64,
     base_name: String,
-    tag_path: String,
+    tag_path: Option<String>,
     jpeg: SourceFile,
     raw: SourceFile,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExportFile {
+    pub source: PathBuf,
+    pub name: String,
+    pub modified_time: f64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExportManifestItem {
+    pub photo_id: i64,
+    pub display_name: String,
+    pub tag_components: Vec<String>,
+    pub files: [ExportFile; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,13 +86,14 @@ fn export_items(connection: &Connection) -> AppResult<Vec<ExportItem>> {
            UNION ALL SELECT t.id,paths.path || '>' || t.name FROM tag_tree t JOIN paths ON t.parent_id=paths.id
          )
          SELECT e.id,e.display_base_name,paths.path FROM photo_entries e
-         JOIN paths ON paths.id=e.tag_id
-         WHERE e.is_missing=0 AND e.pair_status='complete' AND e.is_trashed=0 ORDER BY e.id")?;
+         LEFT JOIN paths ON paths.id=e.tag_id
+         WHERE e.is_missing=0 AND e.pair_status='complete'
+           AND e.is_trashed=0 AND e.is_similarity_hidden=0 ORDER BY e.id")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(2)?,
         ))
     })?;
     let mut items = Vec::new();
@@ -123,12 +139,16 @@ fn safe_component(component: &str) -> String {
     value
 }
 
-fn target_directory(root: &Path, tag_path: &str) -> PathBuf {
-    tag_path
-        .split('>')
-        .fold(root.to_path_buf(), |path, component| {
-            path.join(safe_component(component))
-        })
+fn target_directory(root: &Path, tag_path: Option<&str>) -> PathBuf {
+    tag_path.map_or_else(
+        || root.to_path_buf(),
+        |path| {
+            path.split('>')
+                .fold(root.to_path_buf(), |directory, component| {
+                    directory.join(safe_component(component))
+                })
+        },
+    )
 }
 
 fn original_targets(directory: &Path, item: &ExportItem) -> (PathBuf, PathBuf) {
@@ -183,19 +203,34 @@ fn copy_pair(root: &Path, destination: &(PathBuf, PathBuf), item: &ExportItem) -
     Ok(())
 }
 
-fn skip_counts(connection: &Connection) -> AppResult<(usize, usize, usize)> {
+#[derive(Debug, Default)]
+struct ExportCounts {
+    untagged: usize,
+    incomplete: usize,
+    missing: usize,
+    hidden: usize,
+    trashed: usize,
+}
+
+fn export_counts(connection: &Connection) -> AppResult<ExportCounts> {
     connection
         .query_row(
-            "SELECT SUM(tag_id IS NULL AND is_trashed=0),
-         SUM(tag_id IS NOT NULL AND pair_status!='complete' AND is_missing=0 AND is_trashed=0),
-         SUM(tag_id IS NOT NULL AND is_missing=1 AND is_trashed=0) FROM photo_entries",
+            "SELECT
+         SUM(tag_id IS NULL AND pair_status='complete' AND is_missing=0 AND is_trashed=0 AND is_similarity_hidden=0),
+         SUM(pair_status!='complete' AND is_missing=0 AND is_trashed=0 AND is_similarity_hidden=0),
+         SUM(is_missing=1 AND is_trashed=0 AND is_similarity_hidden=0),
+         SUM(is_similarity_hidden=1 AND is_trashed=0),
+         SUM(is_trashed=1)
+         FROM photo_entries",
             [],
             |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(0) as usize,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0) as usize,
-                    row.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
-                ))
+                Ok(ExportCounts {
+                    untagged: row.get::<_, Option<i64>>(0)?.unwrap_or(0) as usize,
+                    incomplete: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as usize,
+                    missing: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+                    hidden: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
+                    trashed: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as usize,
+                })
             },
         )
         .map_err(AppError::from)
@@ -235,21 +270,36 @@ fn export_preview_items(
             ("trashed", "位于回收站，不导出".into())
         } else if missing {
             ("missing", "源文件丢失".into())
-        } else if tag_path.is_none() {
-            ("untagged", "尚未标注标签".into())
         } else if pair_status != "complete" {
             ("incomplete", format!("配对状态：{pair_status}"))
         } else if let Some(item) = eligible_by_id.get(&id) {
-            let directory = target_directory(export_root, &item.tag_path);
+            let directory = target_directory(export_root, item.tag_path.as_deref());
             let targets = original_targets(&directory, item);
             let conflict = has_conflict(&targets);
-            let relative = format!(
-                "{} / {} + {}",
-                item.tag_path.replace('>', " / "),
-                item.jpeg.original_name,
-                item.raw.original_name
+            let relative = item.tag_path.as_deref().map_or_else(
+                || {
+                    format!(
+                        "根目录 / {} + {}",
+                        item.jpeg.original_name, item.raw.original_name
+                    )
+                },
+                |path| {
+                    format!(
+                        "{} / {} + {}",
+                        path.replace('>', " / "),
+                        item.jpeg.original_name,
+                        item.raw.original_name
+                    )
+                },
             );
-            (if conflict { "conflict" } else { "ready" }, relative)
+            let status = if conflict {
+                "conflict"
+            } else if item.tag_path.is_none() {
+                "untagged"
+            } else {
+                "ready"
+            };
+            (status, relative)
         } else {
             ("incomplete", "缺少可导出的 JPEG/ARW 文件".into())
         };
@@ -264,28 +314,94 @@ fn export_preview_items(
     Ok(preview)
 }
 
-pub fn plan_export(database_path: &Path, export_root: &Path) -> AppResult<ExportPlan> {
+pub(crate) fn manifest(database_path: &Path) -> AppResult<Vec<ExportManifestItem>> {
+    let connection = db::connect(database_path)?;
+    let source_root = PathBuf::from(connection.query_row::<String, _, _>(
+        "SELECT photo_root FROM project_settings WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?);
+    export_items(&connection).map(|items| {
+        items
+            .into_iter()
+            .map(|item| ExportManifestItem {
+                photo_id: item.id,
+                display_name: item.base_name,
+                tag_components: item
+                    .tag_path
+                    .as_deref()
+                    .map(|path| path.split('>').map(safe_component).collect())
+                    .unwrap_or_default(),
+                files: [
+                    ExportFile {
+                        source: source_root.join(item.jpeg.relative_path),
+                        name: item.jpeg.original_name,
+                        modified_time: item.jpeg.modified_time,
+                    },
+                    ExportFile {
+                        source: source_root.join(item.raw.relative_path),
+                        name: item.raw.original_name,
+                        modified_time: item.raw.modified_time,
+                    },
+                ],
+            })
+            .collect()
+    })
+}
+
+pub(crate) fn content_plan(database_path: &Path) -> AppResult<ExportPlan> {
     let connection = db::connect(database_path)?;
     let items = export_items(&connection)?;
-    let (untagged, incomplete, missing) = skip_counts(&connection)?;
+    let counts = export_counts(&connection)?;
+    let mut occupied = std::collections::HashSet::new();
     let conflicts = items
         .iter()
         .filter(|item| {
-            has_conflict(&original_targets(
-                &target_directory(export_root, &item.tag_path),
-                item,
-            ))
+            let directory = item.tag_path.as_deref().unwrap_or("").to_lowercase();
+            let keys = [
+                format!("{directory}/{}", item.jpeg.original_name.to_lowercase()),
+                format!("{directory}/{}", item.raw.original_name.to_lowercase()),
+            ];
+            let conflict = keys.iter().any(|key| occupied.contains(key));
+            occupied.extend(keys);
+            conflict
         })
         .count();
-    let preview_items = export_preview_items(&connection, export_root, &items)?;
     Ok(ExportPlan {
         eligible: items.len(),
         conflicts,
-        skipped_untagged: untagged,
-        skipped_incomplete: incomplete,
-        skipped_missing: missing,
-        items: preview_items,
+        untagged: counts.untagged,
+        skipped_incomplete: counts.incomplete,
+        skipped_missing: counts.missing,
+        skipped_hidden: counts.hidden,
+        skipped_trashed: counts.trashed,
+        items: Vec::new(),
     })
+}
+
+fn validate_empty_directory(export_root: &Path) -> AppResult<()> {
+    if !export_root.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "请选择一个已存在的空目录：{}",
+            export_root.display()
+        )));
+    }
+    if fs::read_dir(export_root)?.next().transpose()?.is_some() {
+        return Err(AppError::InvalidInput(format!(
+            "导出根目录必须为空：{}",
+            export_root.display()
+        )));
+    }
+    Ok(())
+}
+
+pub fn plan_export(database_path: &Path, export_root: &Path) -> AppResult<ExportPlan> {
+    validate_empty_directory(export_root)?;
+    let connection = db::connect(database_path)?;
+    let items = export_items(&connection)?;
+    let mut plan = content_plan(database_path)?;
+    plan.items = export_preview_items(&connection, export_root, &items)?;
+    Ok(plan)
 }
 
 pub fn export_photos(
@@ -293,13 +409,7 @@ pub fn export_photos(
     export_root: &Path,
     strategy: &str,
 ) -> AppResult<ExportSummary> {
-    if export_root.exists() && !export_root.is_dir() {
-        return Err(AppError::InvalidInput(format!(
-            "导出目标不是目录：{}",
-            export_root.display()
-        )));
-    }
-    fs::create_dir_all(export_root)?;
+    validate_empty_directory(export_root)?;
     let strategy = ConflictStrategy::parse(strategy)?;
     let connection = db::connect(database_path)?;
     let root = PathBuf::from(connection.query_row::<String, _, _>(
@@ -308,15 +418,17 @@ pub fn export_photos(
         |row| row.get(0),
     )?);
     let items = export_items(&connection)?;
-    let (untagged, incomplete, missing) = skip_counts(&connection)?;
+    let counts = export_counts(&connection)?;
     let mut summary = ExportSummary {
-        skipped_untagged: untagged,
-        skipped_incomplete: incomplete,
-        skipped_missing: missing,
+        untagged: counts.untagged,
+        skipped_incomplete: counts.incomplete,
+        skipped_missing: counts.missing,
+        skipped_hidden: counts.hidden,
+        skipped_trashed: counts.trashed,
         ..Default::default()
     };
     for item in items {
-        let directory = target_directory(export_root, &item.tag_path);
+        let directory = target_directory(export_root, item.tag_path.as_deref());
         if let Err(error) = fs::create_dir_all(&directory) {
             summary.failed += 1;
             summary.failures.push(ExportFailure {
@@ -355,6 +467,8 @@ pub fn export_photos(
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::File, io::Write};
+
     use super::*;
 
     #[test]
@@ -370,7 +484,7 @@ mod tests {
         let item = ExportItem {
             id: 1,
             base_name: "DSC0001".into(),
-            tag_path: "x".into(),
+            tag_path: Some("x".into()),
             jpeg: SourceFile {
                 relative_path: "a".into(),
                 original_name: "DSC0001.JPG".into(),
@@ -385,5 +499,60 @@ mod tests {
         let (jpeg, raw) = renamed_targets(directory.path(), &item);
         assert_eq!(jpeg.file_name().unwrap(), "DSC0001_1.JPG");
         assert_eq!(raw.file_name().unwrap(), "DSC0001_1.ARW");
+    }
+
+    #[test]
+    fn exports_untagged_and_excludes_hidden_and_trashed_photos() {
+        let workspace = tempfile::tempdir().unwrap();
+        let photo_root = workspace.path().join("photos");
+        std::fs::create_dir(&photo_root).unwrap();
+        for name in ["VISIBLE", "HIDDEN", "TRASHED"] {
+            image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]))
+                .save(photo_root.join(format!("{name}.JPG")))
+                .unwrap();
+            File::create(photo_root.join(format!("{name}.ARW")))
+                .unwrap()
+                .write_all(name.as_bytes())
+                .unwrap();
+        }
+        let database = workspace.path().join("project.sqlite");
+        db::create_project(&database, &photo_root).unwrap();
+        crate::scan::scan_project(&database).unwrap();
+        let connection = db::connect(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE photo_entries SET is_similarity_hidden=1 WHERE display_base_name='HIDDEN'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE photo_entries SET is_trashed=1 WHERE display_base_name='TRASHED'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let export_root = workspace.path().join("export");
+        std::fs::create_dir(&export_root).unwrap();
+        let plan = plan_export(&database, &export_root).unwrap();
+        assert_eq!(plan.eligible, 1);
+        assert_eq!(plan.untagged, 1);
+        assert_eq!(plan.skipped_hidden, 1);
+        assert_eq!(plan.skipped_trashed, 1);
+
+        let summary = export_photos(&database, &export_root, "skip").unwrap();
+        assert_eq!(summary.succeeded, 1);
+        assert!(export_root.join("VISIBLE.JPG").is_file());
+        assert!(export_root.join("VISIBLE.ARW").is_file());
+        assert!(!export_root.join("HIDDEN.JPG").exists());
+        assert!(!export_root.join("TRASHED.JPG").exists());
+    }
+
+    #[test]
+    fn rejects_a_nonempty_export_root() {
+        let directory = tempfile::tempdir().unwrap();
+        File::create(directory.path().join("existing.txt")).unwrap();
+        assert!(validate_empty_directory(directory.path()).is_err());
     }
 }

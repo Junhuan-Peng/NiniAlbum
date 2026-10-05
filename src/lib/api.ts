@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
-  DeleteImpact, ExportPlan, ExportSummary, PhotoEntry, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary
+  BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportSummary, PhotoEntry, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary
 } from './types';
 
 export const api = {
@@ -31,5 +31,14 @@ export const api = {
   checkpoint: () => invoke<void>('checkpoint'),
   planExport: (exportRoot: string) => invoke<ExportPlan>('plan_export', { exportRoot }),
   exportPhotos: (exportRoot: string, strategy: string) =>
-    invoke<ExportSummary>('export_photos', { exportRoot, strategy })
+    invoke<ExportSummary>('export_photos', { exportRoot, strategy }),
+  baiduStatus: () => invoke<BaiduStatus>('baidu_status'),
+  configureBaidu: (appKey: string, secretKey: string) => invoke<void>('configure_baidu', { appKey, secretKey }),
+  openBaiduAuthorization: () => invoke<string>('open_baidu_authorization'),
+  authorizeBaidu: (code: string) => invoke<void>('authorize_baidu', { code }),
+  disconnectBaidu: () => invoke<void>('disconnect_baidu'),
+  listBaiduFolders: (directory?: string) => invoke<BaiduDirectoryListing>('list_baidu_folders', { directory }),
+  createBaiduFolder: (parent: string, name: string) => invoke<string>('create_baidu_folder', { parent, name }),
+  planBaiduExport: (root: string) => invoke<ExportPlan>('plan_baidu_export', { root }),
+  exportToBaidu: (root: string, strategy: string) => invoke<ExportSummary>('export_to_baidu', { root, strategy })
 };

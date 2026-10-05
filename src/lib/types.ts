@@ -65,9 +65,17 @@ export interface ScanProgress { phase: 'discovering' | 'fingerprinting' | 'thumb
 
 export interface DeleteImpact { tagCount: number; affectedPhotos: number; }
 export interface ExportPreviewItem { photoId: number; name: string; tagPath: string | null; status: 'ready' | 'conflict' | 'untagged' | 'incomplete' | 'missing' | 'trashed'; detail: string; }
-export interface ExportPlan { eligible: number; conflicts: number; skippedUntagged: number; skippedIncomplete: number; skippedMissing: number; items: ExportPreviewItem[]; }
+export interface ExportPlan {
+  eligible: number; conflicts: number; untagged: number; skippedIncomplete: number; skippedMissing: number;
+  skippedHidden: number; skippedTrashed: number; items: ExportPreviewItem[];
+}
 export interface ExportFailure { photoId: number; name: string; reason: string; }
 export interface ExportSummary {
-  succeeded: number; skipped: number; renamed: number; failed: number; skippedUntagged: number;
-  skippedIncomplete: number; skippedMissing: number; failures: ExportFailure[];
+  succeeded: number; skipped: number; renamed: number; failed: number; untagged: number;
+  skippedIncomplete: number; skippedMissing: number; skippedHidden: number; skippedTrashed: number;
+  failures: ExportFailure[];
 }
+export interface BaiduStatus { configured: boolean; authorized: boolean; }
+export interface BaiduFolder { name: string; path: string; }
+export interface BaiduDirectoryListing { currentPath: string; isEmpty: boolean; folders: BaiduFolder[]; }
+export interface ExportProgress { destination: 'baidu'; completedFiles: number; totalFiles: number; currentFile: string; }

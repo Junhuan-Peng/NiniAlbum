@@ -1,6 +1,6 @@
 # Nini Albums
 
-本地 JPEG + Sony ARW 层级标签标注与导出工具。应用使用 Tauri v2、Svelte 4、Rust 和 SQLite 构建，不上传或修改源照片。
+JPEG + Sony ARW 层级标签标注与导出工具。应用使用 Tauri v2、Svelte 4、Rust 和 SQLite 构建，不修改源照片；用户可主动选择导出到本地或百度网盘应用目录。
 
 支持单张或批量分配/取消标签、手动组成和修正相似照片组，以及在实际复制前逐项预览导出结果与冲突。
 
@@ -40,5 +40,6 @@ npm run tauri build
 - 标签名称可用 `/` 一次创建多级路径；照片可软标记为待删除并在回收站恢复，源文件不会被删除。
 - 每个项目可为标签绑定唯一的数字快捷键 `1`–`9`，浏览时按数字即可分配标签并自动跳到下一张。
 - 数据库结构版本存放在 `project_settings.schema_version`。后续结构变更应增加版本并执行向前迁移，不能删除旧数据库。
+- 百度网盘应用凭据及 OAuth Token 保存到操作系统凭据存储，不写入项目数据库；导出目标限定为用户选择的空目录。
 
 完整产品和数据规则见 [photo_tagger_vibe_prompt.md](./photo_tagger_vibe_prompt.md)。

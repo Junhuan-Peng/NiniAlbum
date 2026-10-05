@@ -8,7 +8,7 @@
   import TagBranch from './lib/components/TagBranch.svelte';
   import { api } from './lib/api';
   import { toast } from './lib/toast';
-  import type { DeleteImpact, ExportPlan, PhotoEntry, PhotoFilter, ProjectSnapshot, ScanProgress, SortDirection, SortField, TagNode } from './lib/types';
+  import type { BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportProgress, PhotoEntry, PhotoFilter, ProjectSnapshot, ScanProgress, SortDirection, SortField, TagNode } from './lib/types';
 
   let snapshot: ProjectSnapshot | null = null;
   let selectedIndex = 0;
@@ -33,7 +33,14 @@
   let shortcutDialog: TagNode | null = null;
   let shortcutKey = '';
   let deleteDialog: { tag: TagNode; impact: DeleteImpact } | null = null;
-  let exportDialog: { root: string; plan: ExportPlan; strategy: 'skip' | 'overwrite' | 'rename' } | null = null;
+  let exportDestinationDialog = false;
+  let exportDialog: { destination: 'local' | 'baidu'; root: string; plan: ExportPlan; strategy: 'skip' | 'overwrite' | 'rename' } | null = null;
+  let baiduBrowser: BaiduDirectoryListing | null = null;
+  let baiduNewFolder = '';
+  let baiduStatus: BaiduStatus = { configured: false, authorized: false };
+  let baiduAppKey = '';
+  let baiduSecretKey = '';
+  let baiduAuthorizationCode = '';
   let existingProjectDialog: { databasePath: string; photoRoot: string } | null = null;
   let recentProjects: { path: string; name: string; photoRoot: string; lastOpened: number }[] = [];
   let smartKind: 'none' | 'date' | 'location' = 'none';
@@ -112,6 +119,7 @@
     draftAutoSaveEnabled = autoSaveEnabled;
     draftAutoSaveIntervalMinutes = autoSaveIntervalMinutes;
     settingsDialog = true;
+    api.baiduStatus().then((status) => baiduStatus = status).catch(() => undefined);
   }
 
   function thumbnailStyle(photo: PhotoEntry) {
@@ -582,26 +590,102 @@
   }
 
   async function prepareExport() {
+    try { baiduStatus = await api.baiduStatus(); } catch { /* 本地导出仍然可用。 */ }
+    exportDestinationDialog = true;
+  }
+
+  async function prepareLocalExport() {
     const root = await open({ directory: true, multiple: false, title: '选择导出根目录' });
     if (!root || Array.isArray(root)) return;
     await runBusy('正在检查导出内容…', async () => {
-      const plan = await api.planExport(root); exportDialog = { root, plan, strategy: plan.conflicts ? 'skip' : 'overwrite' };
+      const plan = await api.planExport(root);
+      exportDestinationDialog = false;
+      exportDialog = { destination: 'local', root, plan, strategy: plan.conflicts ? 'skip' : 'overwrite' };
     });
+  }
+
+  async function openBaiduBrowser(directory?: string) {
+    await runBusy('正在读取百度网盘目录…', async () => {
+      baiduBrowser = await api.listBaiduFolders(directory);
+      exportDestinationDialog = false;
+    });
+  }
+
+  async function createBaiduExportFolder() {
+    if (!baiduBrowser || !baiduNewFolder.trim()) return;
+    await runBusy('正在创建百度网盘目录…', async () => {
+      const root = await api.createBaiduFolder(baiduBrowser!.currentPath, baiduNewFolder);
+      baiduNewFolder = '';
+      const plan = await api.planBaiduExport(root);
+      baiduBrowser = null;
+      exportDialog = { destination: 'baidu', root, plan, strategy: plan.conflicts ? 'skip' : 'overwrite' };
+    });
+  }
+
+  async function selectBaiduExportRoot() {
+    if (!baiduBrowser?.isEmpty) { toast('请选择一个空目录。'); return; }
+    await runBusy('正在检查导出内容…', async () => {
+      const root = baiduBrowser!.currentPath;
+      const plan = await api.planBaiduExport(root);
+      baiduBrowser = null;
+      exportDialog = { destination: 'baidu', root, plan, strategy: plan.conflicts ? 'skip' : 'overwrite' };
+    });
+  }
+
+  function baiduParent(path: string) {
+    if (path === '/apps/尼尼相册') return null;
+    return path.slice(0, path.lastIndexOf('/')) || '/apps/尼尼相册';
+  }
+
+  function openBaiduParent() {
+    if (!baiduBrowser) return;
+    const parent = baiduParent(baiduBrowser.currentPath);
+    if (parent) openBaiduBrowser(parent);
   }
 
   async function confirmExport() {
     if (!exportDialog) return;
-    const { root, strategy } = exportDialog; exportDialog = null;
-    await runBusy('正在复制 JPEG 与 ARW…', async () => {
-      const result = await api.exportPhotos(root, strategy);
+    const { root, strategy, destination } = exportDialog; exportDialog = null;
+    await runBusy(destination === 'baidu' ? '正在上传到百度网盘…' : '正在复制 JPEG 与 ARW…', async () => {
+      const result = destination === 'baidu' ? await api.exportToBaidu(root, strategy) : await api.exportPhotos(root, strategy);
       toast(`导出完成：成功 ${result.succeeded}，跳过 ${result.skipped}，失败 ${result.failed}${result.renamed ? `，改名 ${result.renamed}` : ''}`, result.failed ? 'error' : 'success', 7000);
     });
+  }
+
+  async function saveBaiduCredentials() {
+    if (!baiduAppKey.trim() || !baiduSecretKey.trim()) { toast('请输入 AppKey 和 SecretKey。'); return; }
+    try {
+      await api.configureBaidu(baiduAppKey, baiduSecretKey);
+      baiduSecretKey = '';
+      baiduStatus = await api.baiduStatus();
+      toast('百度网盘应用凭据已保存到系统凭据存储。', 'success');
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function startBaiduAuthorization() {
+    try { await api.openBaiduAuthorization(); toast('已在浏览器中打开百度授权页。'); }
+    catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function finishBaiduAuthorization() {
+    if (!baiduAuthorizationCode.trim()) return;
+    try {
+      await api.authorizeBaidu(baiduAuthorizationCode);
+      baiduAuthorizationCode = '';
+      baiduStatus = await api.baiduStatus();
+      toast('百度网盘授权成功。', 'success');
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function disconnectBaidu() {
+    try { await api.disconnectBaidu(); baiduStatus = await api.baiduStatus(); toast('已移除百度网盘授权。'); }
+    catch (error) { toast(errorMessage(error), 'error'); }
   }
 
   function handleKeydown(event: KeyboardEvent) {
     const target = event.target as HTMLElement;
     if (['INPUT','TEXTAREA','SELECT'].includes(target.tagName) || target.isContentEditable) return;
-    if (!snapshot || tagDialog || shortcutDialog || deleteDialog || exportDialog || existingProjectDialog || settingsDialog) return;
+    if (!snapshot || tagDialog || shortcutDialog || deleteDialog || exportDestinationDialog || exportDialog || baiduBrowser || existingProjectDialog || settingsDialog) return;
     if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
     if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
     if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
@@ -700,6 +784,7 @@
     } catch { /* 使用默认设置。 */ }
     const maintenanceTimer = window.setInterval(runBackgroundMaintenance, 15_000);
     let unlisten: (() => void) | undefined;
+    let unlistenExport: (() => void) | undefined;
     listen<ScanProgress>('scan-progress', ({ payload }) => {
       if (scanProgress?.phase === payload.phase && scanProgress.message === payload.message
         && payload.completed < scanProgress.completed) return;
@@ -708,7 +793,12 @@
         ? `${payload.message} ${payload.completed}/${payload.total}`
         : payload.message;
     }).then((dispose) => { unlisten = dispose; }).catch(() => { /* Browser-only preview has no Tauri event bridge. */ });
-    return () => { unlisten?.(); window.clearInterval(maintenanceTimer); };
+    listen<ExportProgress>('export-progress', ({ payload }) => {
+      busyLabel = payload.totalFiles > 0
+        ? `正在上传 ${payload.currentFile} ${payload.completedFiles}/${payload.totalFiles}`
+        : '正在准备上传…';
+    }).then((dispose) => { unlistenExport = dispose; }).catch(() => { /* Browser-only preview has no Tauri event bridge. */ });
+    return () => { unlisten?.(); unlistenExport?.(); window.clearInterval(maintenanceTimer); };
   });
 </script>
 
@@ -835,11 +925,15 @@
 
 {#if deleteDialog}<Modal title="删除标签" description={`将删除“${deleteDialog.tag.name}”及其 ${deleteDialog.impact.tagCount - 1} 个子标签。`} on:close={() => deleteDialog = null}>{#if deleteDialog.impact.affectedPhotos > 0}<p class="rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm">标签子树正在被 <strong>{deleteDialog.impact.affectedPhotos}</strong> 张照片使用。请选择取消，或先将这些照片设为未标记再删除。</p>{:else}<p class="text-sm text-muted">该标签子树没有照片引用，可以安全删除。</p>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => deleteDialog = null}>不删除</Button><Button variant="danger" on:click={confirmDelete}>{deleteDialog.impact.affectedPhotos > 0 ? '取消标记并删除' : '确认删除'}</Button></div></Modal>{/if}
 
-{#if exportDialog}<Modal title="导出前预览" description={`将导出到 ${exportDialog.root}`} on:close={() => exportDialog = null}><div class="grid grid-cols-2 gap-2 text-sm"><div class="rounded bg-white/5 p-3">可导出 <strong class="float-right text-accent">{exportDialog.plan.eligible}</strong></div><div class="rounded bg-white/5 p-3">同名冲突 <strong class="float-right text-amber-300">{exportDialog.plan.conflicts}</strong></div><div class="rounded bg-white/5 p-3">未标记 <strong class="float-right">{exportDialog.plan.skippedUntagged}</strong></div><div class="rounded bg-white/5 p-3">缺失/不完整 <strong class="float-right">{exportDialog.plan.skippedMissing + exportDialog.plan.skippedIncomplete}</strong></div></div><div class="mt-4 flex items-center justify-between"><span class="text-xs font-medium">照片明细</span><span class="text-[10px] text-muted">共 {exportDialog.plan.items.length} 张</span></div><div class="mt-1 max-h-64 overflow-y-auto rounded-lg border border-border bg-black/10"><div class="sticky top-0 grid grid-cols-[minmax(0,1fr)_74px] border-b border-border bg-[#181b1f] px-3 py-2 text-[9px] uppercase tracking-wider text-muted"><span>照片 / 目标</span><span>处理结果</span></div>{#each exportDialog.plan.items as item (item.photoId)}<div class="grid grid-cols-[minmax(0,1fr)_74px] items-center gap-2 border-b border-border/60 px-3 py-2 last:border-b-0"><div class="min-w-0"><div class="truncate text-xs" title={item.name}>{item.name}</div><div class="mt-0.5 truncate text-[9px] text-muted" title={item.detail}>{item.detail}</div></div><span class:text-accent={item.status === 'ready'} class:text-amber-300={item.status === 'conflict'} class:text-danger={item.status === 'missing'} class="text-[10px]">{item.status === 'ready' ? '可导出' : item.status === 'conflict' ? '同名冲突' : item.status === 'untagged' ? '未标记' : item.status === 'incomplete' ? '配对不完整' : item.status === 'missing' ? '文件丢失' : '回收站'}</span></div>{/each}</div>{#if exportDialog.plan.conflicts > 0}<label class="mt-4 block text-xs text-muted" for="strategy">本次所有同名冲突</label><select id="strategy" bind:value={exportDialog.strategy} class="mt-1 h-10 w-full rounded border border-border bg-[#101215] px-3 text-sm"><option value="skip">全部跳过</option><option value="overwrite">全部覆盖</option><option value="rename">全部自动改名</option></select>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => exportDialog = null}>取消</Button><Button variant="primary" on:click={confirmExport}>开始导出</Button></div></Modal>{/if}
+{#if exportDestinationDialog}<Modal title="导出照片" description="选择导出位置；两种方式都要求使用空目录。" on:close={() => exportDestinationDialog = false}><div class="grid gap-3 sm:grid-cols-2"><button class="rounded-xl border border-border bg-white/5 p-4 text-left hover:border-accent/50" on:click={prepareLocalExport}><strong class="text-sm">导出到本地</strong><p class="mt-1 text-xs leading-5 text-muted">选择一个已存在的空目录，保留 JPEG/ARW 修改时间。</p></button><button class="rounded-xl border border-border bg-white/5 p-4 text-left hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-45" disabled={!baiduStatus.authorized} on:click={() => openBaiduBrowser()}><strong class="text-sm">导出到百度网盘</strong><p class="mt-1 text-xs leading-5 text-muted">在“我的应用数据/尼尼相册”中选择或新建空目录。</p></button></div>{#if !baiduStatus.authorized}<p class="mt-3 rounded-lg border border-border p-3 text-xs text-muted">百度网盘尚未授权，请先在设置中配置并授权。</p>{/if}</Modal>{/if}
+
+{#if baiduBrowser}<Modal title="选择百度网盘空目录" description={baiduBrowser.currentPath} on:close={() => baiduBrowser = null}><div class="mb-3 flex gap-2">{#if baiduParent(baiduBrowser.currentPath)}<Button size="sm" variant="ghost" on:click={openBaiduParent}>返回上级</Button>{/if}<Button size="sm" variant="primary" disabled={!baiduBrowser.isEmpty} on:click={selectBaiduExportRoot}>选择当前空目录</Button></div><div class="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-border p-2">{#each baiduBrowser.folders as folder}<button class="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm hover:bg-white/5" on:click={() => openBaiduBrowser(folder.path)}><span>▸</span><span class="truncate">{folder.name}</span></button>{:else}<p class="p-3 text-center text-xs text-muted">当前目录没有子目录</p>{/each}</div><div class="mt-4 flex gap-2"><input bind:value={baiduNewFolder} class="h-10 min-w-0 flex-1 rounded-md border border-border bg-[#101215] px-3 text-sm" placeholder="新建空目录名称" /><Button on:click={createBaiduExportFolder} disabled={!baiduNewFolder.trim()}>新建并选择</Button></div>{#if !baiduBrowser.isEmpty}<p class="mt-2 text-xs text-amber-300">当前目录不是空目录，不能作为导出根目录。</p>{/if}</Modal>{/if}
+
+{#if exportDialog}<Modal title={exportDialog.destination === 'baidu' ? '确认导出到百度网盘' : '确认本地导出'} description={`将导出到空目录 ${exportDialog.root}`} on:close={() => exportDialog = null}><div class="grid grid-cols-2 gap-2 text-sm"><div class="rounded bg-white/5 p-3">可导出 <strong class="float-right text-accent">{exportDialog.plan.eligible}</strong></div><div class="rounded bg-white/5 p-3">未标记（根目录） <strong class="float-right">{exportDialog.plan.untagged}</strong></div><div class="rounded bg-white/5 p-3">同名冲突 <strong class="float-right text-amber-300">{exportDialog.plan.conflicts}</strong></div><div class="rounded bg-white/5 p-3">缺失/不完整 <strong class="float-right">{exportDialog.plan.skippedMissing + exportDialog.plan.skippedIncomplete}</strong></div><div class="rounded bg-white/5 p-3">已隐藏 <strong class="float-right">{exportDialog.plan.skippedHidden}</strong></div><div class="rounded bg-white/5 p-3">回收站 <strong class="float-right">{exportDialog.plan.skippedTrashed}</strong></div></div>{#if exportDialog.plan.items.length}<div class="mt-4 flex items-center justify-between"><span class="text-xs font-medium">照片明细</span><span class="text-[10px] text-muted">共 {exportDialog.plan.items.length} 张</span></div><div class="mt-1 max-h-64 overflow-y-auto rounded-lg border border-border bg-black/10"><div class="sticky top-0 grid grid-cols-[minmax(0,1fr)_74px] border-b border-border bg-[#181b1f] px-3 py-2 text-[9px] uppercase tracking-wider text-muted"><span>照片 / 目标</span><span>处理结果</span></div>{#each exportDialog.plan.items as item (item.photoId)}<div class="grid grid-cols-[minmax(0,1fr)_74px] items-center gap-2 border-b border-border/60 px-3 py-2 last:border-b-0"><div class="min-w-0"><div class="truncate text-xs" title={item.name}>{item.name}</div><div class="mt-0.5 truncate text-[9px] text-muted" title={item.detail}>{item.detail}</div></div><span class:text-accent={item.status === 'ready' || item.status === 'untagged'} class:text-amber-300={item.status === 'conflict'} class:text-danger={item.status === 'missing'} class="text-[10px]">{item.status === 'ready' ? '可导出' : item.status === 'conflict' ? '同名冲突' : item.status === 'untagged' ? '导出到根目录' : item.status === 'incomplete' ? '配对不完整' : item.status === 'missing' ? '文件丢失' : '回收站'}</span></div>{/each}</div>{/if}{#if exportDialog.plan.conflicts > 0}<label class="mt-4 block text-xs text-muted" for="strategy">本次所有同名冲突</label><select id="strategy" bind:value={exportDialog.strategy} class="mt-1 h-10 w-full rounded border border-border bg-[#101215] px-3 text-sm"><option value="skip">全部跳过</option><option value="overwrite">全部覆盖</option><option value="rename">全部自动改名</option></select>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => exportDialog = null}>取消</Button><Button variant="primary" on:click={confirmExport}>开始导出</Button></div></Modal>{/if}
 
 {#if existingProjectDialog}<Modal title="项目文件已存在" description={existingProjectDialog.databasePath} on:close={() => existingProjectDialog = null}><div class="space-y-3 text-sm"><div class="rounded-lg border border-border bg-white/5 p-3"><strong class="block">打开并升级</strong><p class="mt-1 text-xs leading-5 text-muted">保留已有标签、扫描记录和项目设置，并自动升级数据库结构。</p></div><div class="rounded-lg border border-danger/30 bg-danger/10 p-3"><strong class="block text-danger">强制覆盖</strong><p class="mt-1 text-xs leading-5 text-muted">删除原项目数据库及其中的标签和索引，再创建空项目；照片目录中的原文件不会被删除。</p></div></div><div class="mt-5 flex flex-wrap justify-end gap-2"><Button variant="ghost" on:click={() => existingProjectDialog = null}>取消</Button><Button on:click={() => resolveExistingProject('upgrade')}>打开并升级</Button><Button variant="danger" on:click={() => resolveExistingProject('overwrite')}>强制覆盖</Button></div></Modal>{/if}
 
-{#if settingsDialog}<Modal title="设置" description="Nini Albums 软件设置" on:close={() => settingsDialog = false}><div class="space-y-4"><label class="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-border bg-white/5 p-3"><div><strong class="block text-sm">自动保存</strong><p class="mt-1 text-xs leading-5 text-muted">标签和隐藏状态始终即时入库。开启后还会定期将 SQLite WAL 完整合并到项目文件。</p></div><input type="checkbox" bind:checked={draftAutoSaveEnabled} class="mt-1 h-4 w-4 accent-[#d9ff5b]" /></label><label class="block"><span class="mb-1.5 block text-xs text-muted">自动保存间隔</span><select bind:value={draftAutoSaveIntervalMinutes} disabled={!draftAutoSaveEnabled} class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm disabled:opacity-45"><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={30}>每 30 分钟</option></select></label><div class="rounded-lg border border-border p-3 text-xs leading-5 text-muted"><div class="flex justify-between"><span>照片变更检测</span><span class="text-foreground">每 30 秒</span></div><p class="mt-1">只检查支持格式的路径、文件大小和修改时间；发现变化后会提示使用顶部刷新按钮。</p></div></div><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => settingsDialog = false}>取消</Button><Button variant="primary" on:click={saveSettings}>保存设置</Button></div></Modal>{/if}
+{#if settingsDialog}<Modal title="设置" description="Nini Albums 软件设置" on:close={() => settingsDialog = false}><div class="max-h-[65vh] space-y-4 overflow-y-auto pr-1"><label class="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-border bg-white/5 p-3"><div><strong class="block text-sm">自动保存</strong><p class="mt-1 text-xs leading-5 text-muted">标签和隐藏状态始终即时入库。开启后还会定期将 SQLite WAL 完整合并到项目文件。</p></div><input type="checkbox" bind:checked={draftAutoSaveEnabled} class="mt-1 h-4 w-4 accent-[#d9ff5b]" /></label><label class="block"><span class="mb-1.5 block text-xs text-muted">自动保存间隔</span><select bind:value={draftAutoSaveIntervalMinutes} disabled={!draftAutoSaveEnabled} class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm disabled:opacity-45"><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={30}>每 30 分钟</option></select></label><div class="rounded-lg border border-border p-3 text-xs leading-5 text-muted"><div class="flex justify-between"><span>照片变更检测</span><span class="text-foreground">每 30 秒</span></div><p class="mt-1">只检查支持格式的路径、文件大小和修改时间；发现变化后会提示使用顶部刷新按钮。</p></div><section class="rounded-xl border border-border bg-white/[.03] p-3"><div class="flex items-center justify-between"><strong class="text-sm">百度网盘</strong><span class={baiduStatus.authorized ? 'text-xs text-accent' : 'text-xs text-muted'}>{baiduStatus.authorized ? '已授权' : baiduStatus.configured ? '待授权' : '未配置'}</span></div><p class="mt-1 text-xs leading-5 text-muted">应用凭据和 OAuth Token 只保存在操作系统凭据存储中，不写入项目数据库。</p><div class="mt-3 grid gap-2"><input bind:value={baiduAppKey} class="h-9 rounded border border-border bg-[#101215] px-3 text-xs" placeholder="AppKey" /><input bind:value={baiduSecretKey} type="password" class="h-9 rounded border border-border bg-[#101215] px-3 text-xs" placeholder="SecretKey（不会回显）" /><Button size="sm" on:click={saveBaiduCredentials}>保存应用凭据</Button></div>{#if baiduStatus.configured}<div class="mt-3 border-t border-border pt-3">{#if !baiduStatus.authorized}<Button size="sm" on:click={startBaiduAuthorization}>打开百度授权页</Button><div class="mt-2 flex gap-2"><input bind:value={baiduAuthorizationCode} class="h-9 min-w-0 flex-1 rounded border border-border bg-[#101215] px-3 text-xs" placeholder="粘贴授权码" /><Button size="sm" variant="primary" on:click={finishBaiduAuthorization}>完成授权</Button></div>{:else}<Button size="sm" variant="ghost" on:click={disconnectBaidu}>移除授权</Button>{/if}</div>{/if}</section></div><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => settingsDialog = false}>取消</Button><Button variant="primary" on:click={saveSettings}>保存设置</Button></div></Modal>{/if}
 
 <ToastViewport />
 

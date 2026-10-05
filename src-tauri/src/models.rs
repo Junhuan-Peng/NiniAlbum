@@ -128,9 +128,11 @@ pub struct DeleteImpact {
 pub struct ExportPlan {
     pub eligible: usize,
     pub conflicts: usize,
-    pub skipped_untagged: usize,
+    pub untagged: usize,
     pub skipped_incomplete: usize,
     pub skipped_missing: usize,
+    pub skipped_hidden: usize,
+    pub skipped_trashed: usize,
     pub items: Vec<ExportPreviewItem>,
 }
 
@@ -159,8 +161,41 @@ pub struct ExportSummary {
     pub skipped: usize,
     pub renamed: usize,
     pub failed: usize,
-    pub skipped_untagged: usize,
+    pub untagged: usize,
     pub skipped_incomplete: usize,
     pub skipped_missing: usize,
+    pub skipped_hidden: usize,
+    pub skipped_trashed: usize,
     pub failures: Vec<ExportFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduStatus {
+    pub configured: bool,
+    pub authorized: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduFolder {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduDirectoryListing {
+    pub current_path: String,
+    pub is_empty: bool,
+    pub folders: Vec<BaiduFolder>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgress {
+    pub destination: String,
+    pub completed_files: usize,
+    pub total_files: usize,
+    pub current_file: String,
 }

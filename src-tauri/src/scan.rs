@@ -1182,9 +1182,16 @@ mod tests {
             .expect("the real collection should contain at least one complete pair");
         let tag_id = db::create_tag(&connection, None, "真实目录冒烟测试").unwrap();
         db::assign_tag(&connection, photo_id, Some(tag_id)).unwrap();
+        connection
+            .execute(
+                "UPDATE photo_entries SET is_similarity_hidden=1 WHERE id != ?1",
+                [photo_id],
+            )
+            .unwrap();
         drop(connection);
 
         let export_root = workspace.path().join("export");
+        std::fs::create_dir(&export_root).unwrap();
         let exported = crate::export::export_photos(&database, &export_root, "skip").unwrap();
         assert_eq!(exported.succeeded, 1);
         assert_eq!(exported.failed, 0);

@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{
+    baidu,
     db::{self, AppState},
     error::CommandResult,
     export,
     models::{
-        DeleteImpact, ExportPlan, ExportSummary, PhotoQuery, ProjectInfo, ProjectSnapshot,
-        ScanSummary,
+        BaiduDirectoryListing, BaiduStatus, DeleteImpact, ExportPlan, ExportProgress,
+        ExportSummary, PhotoQuery, ProjectInfo, ProjectSnapshot, ScanSummary,
     },
     scan,
 };
@@ -247,6 +248,93 @@ pub async fn export_photos(
     let database_path = state.project_path().command()?;
     tauri::async_runtime::spawn_blocking(move || {
         export::export_photos(&database_path, &PathBuf::from(export_root), &strategy).command()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn baidu_status() -> Result<BaiduStatus, String> {
+    baidu::status().command()
+}
+
+#[tauri::command]
+pub fn configure_baidu(app_key: String, secret_key: String) -> Result<(), String> {
+    baidu::configure(app_key, secret_key).command()
+}
+
+#[tauri::command]
+pub fn open_baidu_authorization() -> Result<String, String> {
+    baidu::open_authorization().command()
+}
+
+#[tauri::command]
+pub async fn authorize_baidu(code: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || baidu::exchange_code(code).command())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn disconnect_baidu() -> Result<(), String> {
+    baidu::disconnect().command()
+}
+
+#[tauri::command]
+pub async fn list_baidu_folders(
+    directory: Option<String>,
+) -> Result<BaiduDirectoryListing, String> {
+    tauri::async_runtime::spawn_blocking(move || baidu::list_folders(directory).command())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_baidu_folder(parent: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || baidu::create_folder(parent, name).command())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn plan_baidu_export(
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<ExportPlan, String> {
+    let database_path = state.project_path().command()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        baidu::plan_export(&database_path, &root).command()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn export_to_baidu(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+    strategy: String,
+) -> Result<ExportSummary, String> {
+    let database_path = state.project_path().command()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        baidu::export_photos(
+            &database_path,
+            &root,
+            &strategy,
+            |completed, total, file| {
+                let _ = app.emit(
+                    "export-progress",
+                    ExportProgress {
+                        destination: "baidu".into(),
+                        completed_files: completed,
+                        total_files: total,
+                        current_file: file.into(),
+                    },
+                );
+            },
+        )
+        .command()
     })
     .await
     .map_err(|error| error.to_string())?
