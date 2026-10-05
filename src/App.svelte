@@ -39,6 +39,16 @@
   let similarPhotos: PhotoEntry[] = [];
   let similarLoading = false;
   let similarityRequest = 0;
+  let projectMenuOpen = false;
+  let settingsDialog = false;
+  let autoSaveEnabled = true;
+  let autoSaveIntervalMinutes = 5;
+  let draftAutoSaveEnabled = true;
+  let draftAutoSaveIntervalMinutes = 5;
+  let lastAutoSave = Date.now();
+  let lastChangeCheck = 0;
+  let maintenanceRunning = false;
+  let sourceChanged = false;
 
   $: sourcePhotos = snapshot?.photos ?? [];
   $: smartOptions = Array.from(new Set(sourcePhotos.map((photo) => smartValue(photo, smartKind)).filter((value): value is string => Boolean(value)))).sort();
@@ -57,6 +67,8 @@
   $: scanPercent = scanProgress && scanProgress.total > 0
     ? Math.min(100, Math.round((scanProgress.completed / scanProgress.total) * 100))
     : 0;
+  $: projectFolderName = snapshot ? pathLastPart(snapshot.project.photoRoot) : 'Nini Albums';
+  $: projectInitial = Array.from(projectFolderName.trim())[0]?.toUpperCase() ?? 'N';
 
   const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -68,6 +80,25 @@
 
   function projectName(path: string) {
     return path.split(/[\\/]/).pop()?.replace(/\.sqlite$/i, '') || '未命名项目';
+  }
+
+  function pathLastPart(path: string) {
+    return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path;
+  }
+
+  function saveSettings() {
+    autoSaveEnabled = draftAutoSaveEnabled;
+    autoSaveIntervalMinutes = draftAutoSaveIntervalMinutes;
+    localStorage.setItem('nini-albums-settings', JSON.stringify({ autoSaveEnabled, autoSaveIntervalMinutes }));
+    lastAutoSave = Date.now();
+    settingsDialog = false;
+    toast('设置已保存。', 'success');
+  }
+
+  function openSettings() {
+    draftAutoSaveEnabled = autoSaveEnabled;
+    draftAutoSaveIntervalMinutes = autoSaveIntervalMinutes;
+    settingsDialog = true;
   }
 
   function thumbnailStyle(photo: PhotoEntry) {
@@ -132,32 +163,38 @@
     let databasePath = await save({ title: '保存项目数据库', defaultPath: 'nini-albums.sqlite', filters: [{ name: 'SQLite 项目', extensions: ['sqlite'] }] });
     if (!databasePath) return;
     if (!databasePath.toLowerCase().endsWith('.sqlite')) databasePath += '.sqlite';
+    let created = false;
     busy = true; busyLabel = '正在创建项目…';
     try {
       await api.createProject(databasePath, photoRoot);
       filter = 'all'; selectedIndex = 0; await refresh(null);
       rememberProject(databasePath, photoRoot);
-      toast('项目已创建，可以开始扫描照片。', 'success');
+      toast('项目已创建，正在首次扫描照片。', 'success');
+      created = true;
     } catch (error) {
       const message = errorMessage(error);
       if (message.includes('项目数据库已存在')) existingProjectDialog = { databasePath, photoRoot };
       else toast(message, 'error', 6000);
     } finally { busy = false; busyLabel = ''; }
+    if (created) await scanPhotos();
   }
 
   async function resolveExistingProject(action: 'upgrade' | 'overwrite') {
     if (!existingProjectDialog) return;
     const { databasePath, photoRoot } = existingProjectDialog;
     existingProjectDialog = null;
-    await runBusy(action === 'upgrade' ? '正在升级项目…' : '正在覆盖项目…', async () => {
+    const shouldScan = await runBusy(action === 'upgrade' ? '正在升级项目…' : '正在覆盖项目…', async () => {
       const info = action === 'upgrade'
         ? await api.openProject(databasePath)
         : await api.replaceProject(databasePath, photoRoot);
       filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
       await refresh(null);
+      sourceChanged = false; lastChangeCheck = 0;
       rememberProject(databasePath, info.photoRoot);
       toast(action === 'upgrade' ? '旧项目已升级并打开，原有标签和索引已保留。' : '旧项目已覆盖，照片原文件未被修改。', 'success', 6000);
+      return action === 'overwrite';
     });
+    if (shouldScan) await scanPhotos();
   }
 
   async function openProject() {
@@ -167,6 +204,7 @@
       const info = await api.openProject(path);
       filter = 'all'; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
       await refresh(null);
+      sourceChanged = false; lastChangeCheck = 0;
       rememberProject(path, info.photoRoot);
       toast(info.photoRootAvailable ? '项目已打开。' : '项目已打开，但原照片目录不可用，请重新定位。', info.photoRootAvailable ? 'success' : 'error', 6000);
     });
@@ -177,6 +215,7 @@
       const info = await api.openProject(path);
       filter = 'all'; smartKind = 'none'; smartGroup = ''; sortField = info.sortField; sortDirection = info.sortDirection; selectedIndex = 0;
       await refresh(null);
+      sourceChanged = false; lastChangeCheck = 0;
       rememberProject(path, info.photoRoot);
       toast(info.photoRootAvailable ? '项目已打开。' : '原照片目录不可用，请重新定位。', info.photoRootAvailable ? 'success' : 'error');
     });
@@ -186,20 +225,12 @@
     scanProgress = { phase: 'discovering', completed: 0, total: 0, message: '正在递归发现照片文件' };
     try {
       await runBusy('正在扫描…', async () => {
-        const result = await api.scan(); await refresh();
+        const result = await api.scan(); sourceChanged = false; await refresh();
         toast(`扫描完成：${result.totalGroups} 组，完整 ${result.complete}，缺配对 ${result.missingJpeg + result.missingRaw}，冲突 ${result.conflicts}`, result.warnings.length ? 'default' : 'success', 6000);
       });
     } finally {
       scanProgress = null;
     }
-  }
-
-  async function relocatePhotoRoot() {
-    if (!snapshot) return;
-    const root = await open({ directory: true, multiple: false, title: '重新定位照片根目录' });
-    if (!root || Array.isArray(root)) return;
-    try { await api.setPhotoRoot(root); await refresh(); toast('照片根目录已更新，请重新扫描。', 'success'); }
-    catch (error) { toast(errorMessage(error), 'error'); }
   }
 
   async function loadPreview(photo: PhotoEntry | null) {
@@ -323,17 +354,10 @@
     });
   }
 
-  async function syncProject() {
-    if (!snapshot) return;
-    try { await api.checkpoint(); toast('项目数据已同步到磁盘。', 'success'); }
-    catch (error) { toast(errorMessage(error), 'error'); }
-  }
-
   function handleKeydown(event: KeyboardEvent) {
     const target = event.target as HTMLElement;
     if (['INPUT','TEXTAREA','SELECT'].includes(target.tagName) || target.isContentEditable) return;
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); syncProject(); return; }
-    if (!snapshot || tagDialog || deleteDialog || exportDialog || existingProjectDialog) return;
+    if (!snapshot || tagDialog || deleteDialog || exportDialog || existingProjectDialog || settingsDialog) return;
     if (previewData && (event.key === '+' || event.key === '=')) { event.preventDefault(); zoomBy(1.2); return; }
     if (previewData && event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); return; }
     if (previewData && event.key === '0') { event.preventDefault(); resetPreview(); return; }
@@ -394,11 +418,36 @@
     queueMicrotask(() => node.focus());
   }
 
+  async function runBackgroundMaintenance() {
+    if (!snapshot || busy || maintenanceRunning) return;
+    maintenanceRunning = true;
+    const now = Date.now();
+    try {
+      if (autoSaveEnabled && now - lastAutoSave >= autoSaveIntervalMinutes * 60_000) {
+        await api.checkpoint();
+        lastAutoSave = now;
+      }
+      if (now - lastChangeCheck >= 30_000) {
+        lastChangeCheck = now;
+        const changed = await api.photoRootHasChanges();
+        if (changed && !sourceChanged) toast('检测到照片目录发生变化，请点击顶部刷新按钮更新项目。', 'default', 7000);
+        sourceChanged = changed;
+      }
+    } catch { /* 后台检查失败不打断当前操作。 */ }
+    finally { maintenanceRunning = false; }
+  }
+
   onMount(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('nini-albums-recent-projects') ?? '[]');
       if (Array.isArray(stored)) recentProjects = stored.slice(0, 6);
     } catch { recentProjects = []; }
+    try {
+      const stored = JSON.parse(localStorage.getItem('nini-albums-settings') ?? '{}');
+      if (typeof stored.autoSaveEnabled === 'boolean') autoSaveEnabled = stored.autoSaveEnabled;
+      if ([1, 5, 10, 30].includes(stored.autoSaveIntervalMinutes)) autoSaveIntervalMinutes = stored.autoSaveIntervalMinutes;
+    } catch { /* 使用默认设置。 */ }
+    const maintenanceTimer = window.setInterval(runBackgroundMaintenance, 15_000);
     let unlisten: (() => void) | undefined;
     listen<ScanProgress>('scan-progress', ({ payload }) => {
       if (scanProgress?.phase === payload.phase && scanProgress.message === payload.message
@@ -408,21 +457,26 @@
         ? `${payload.message} ${payload.completed}/${payload.total}`
         : payload.message;
     }).then((dispose) => { unlisten = dispose; }).catch(() => { /* Browser-only preview has no Tauri event bridge. */ });
-    return () => unlisten?.();
+    return () => { unlisten?.(); window.clearInterval(maintenanceTimer); };
   });
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
 
 <main class="flex h-full min-h-0 flex-col bg-background text-foreground">
-  <header class="flex min-h-16 shrink-0 items-center gap-4 border-b border-border bg-[#15171a] px-4 py-2">
-    <div class="flex min-w-[210px] shrink-0 items-center gap-3"><div class="grid h-9 w-9 place-items-center rounded-xl bg-accent font-black text-black">N</div><div class="min-w-0 leading-tight"><strong class="block text-sm">Nini Albums</strong><span class="block max-w-52 truncate text-[10px] text-muted">{snapshot?.project.databasePath ?? '尚未打开项目'}</span></div></div>
-    <div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto pb-0.5">
-      <div class="flex shrink-0 items-center gap-2 rounded-xl border border-border bg-black/15 p-1"><span class="px-1.5 text-[9px] font-semibold uppercase tracking-widest text-muted">项目</span><Button size="sm" on:click={createProject}>新建</Button><Button size="sm" on:click={openProject}>打开</Button></div>
-      <div class="flex shrink-0 items-center gap-2 rounded-xl border border-border bg-black/15 p-1"><span class="px-1.5 text-[9px] font-semibold uppercase tracking-widest text-muted">照片</span><Button size="sm" disabled={!snapshot || busy} on:click={scanPhotos}>递归扫描</Button><Button size="sm" variant="ghost" disabled={!snapshot || busy} on:click={relocatePhotoRoot}>照片目录</Button><Button size="sm" variant="primary" disabled={!snapshot || busy} on:click={prepareExport}>批量导出</Button></div>
-      <Button class="shrink-0" size="sm" variant="ghost" disabled={!snapshot} on:click={syncProject}>同步</Button>
-    </div>
-    <div class="ml-auto flex shrink-0 items-center gap-2 text-xs text-muted">{#if busy}<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-r-transparent"></span><span class="max-w-48 truncate">{busyLabel}</span>{/if}</div>
+  <header class="flex h-16 shrink-0 items-center gap-3 border-b border-border bg-[#15171a] px-4">
+    <div class="flex min-w-0 items-center gap-3"><div class="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-accent text-lg font-black text-black">{projectInitial}</div><div class="min-w-0 leading-tight"><strong class="block max-w-64 truncate text-sm">{projectFolderName}</strong><span class="block max-w-72 truncate text-[10px] text-muted">{snapshot?.project.photoRoot ?? '本地照片标注工具'}</span></div></div>
+    {#if snapshot}
+      <div class="relative ml-1">
+        <button class="grid h-9 w-9 place-items-center rounded-lg border border-border bg-[#22252a] text-lg text-muted hover:border-[#444952] hover:text-foreground" aria-label="项目菜单" aria-expanded={projectMenuOpen} on:click={() => projectMenuOpen = !projectMenuOpen}>•••</button>
+        {#if projectMenuOpen}<div class="absolute left-0 top-11 z-40 w-40 rounded-lg border border-border bg-[#1b1e22] p-1.5 text-xs shadow-2xl"><button class="w-full rounded px-3 py-2 text-left hover:bg-white/5" on:click={() => { projectMenuOpen = false; createProject(); }}>新建项目</button><button class="w-full rounded px-3 py-2 text-left hover:bg-white/5" on:click={() => { projectMenuOpen = false; openProject(); }}>打开其他项目</button></div>{/if}
+      </div>
+      <div class="ml-1 h-6 w-px bg-border"></div>
+      <button class="relative grid h-9 w-9 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-accent/40 hover:text-foreground disabled:opacity-40" disabled={busy} on:click={scanPhotos} aria-label="刷新照片目录" title={sourceChanged ? '检测到文件变化，点击刷新' : '刷新照片目录'}><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M20 11a8 8 0 0 0-14.9-4M4 4v5h5M4 13a8 8 0 0 0 14.9 4M20 20v-5h-5" /></svg>{#if sourceChanged}<span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#15171a] bg-amber-400"></span>{/if}</button>
+      <button class="grid h-9 w-9 place-items-center rounded-lg border border-border bg-accent text-black hover:bg-[#e5ff83] disabled:opacity-40" disabled={busy} on:click={prepareExport} aria-label="批量导出" title="批量导出"><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><path d="M12 3v12m0-12 4 4m-4-4L8 7M5 14v6h14v-6" /></svg></button>
+    {/if}
+    <button class="ml-auto grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-border bg-[#22252a] text-muted hover:border-[#444952] hover:text-foreground" on:click={openSettings} aria-label="设置" title="设置"><svg viewBox="0 0 24 24" class="h-4 w-4 fill-none stroke-current" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
+    <div class="flex shrink-0 items-center gap-2 text-xs text-muted">{#if busy}<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-r-transparent"></span><span class="max-w-48 truncate">{busyLabel}</span>{/if}</div>
   </header>
 
   {#if busy && scanProgress}
@@ -517,6 +571,8 @@
 {#if exportDialog}<Modal title="确认批量导出" description={`将导出到 ${exportDialog.root}`} on:close={() => exportDialog = null}><div class="grid grid-cols-2 gap-2 text-sm"><div class="rounded bg-white/5 p-3">可导出 <strong class="float-right text-accent">{exportDialog.plan.eligible}</strong></div><div class="rounded bg-white/5 p-3">同名冲突 <strong class="float-right text-amber-300">{exportDialog.plan.conflicts}</strong></div><div class="rounded bg-white/5 p-3">未标记 <strong class="float-right">{exportDialog.plan.skippedUntagged}</strong></div><div class="rounded bg-white/5 p-3">缺失/不完整 <strong class="float-right">{exportDialog.plan.skippedMissing + exportDialog.plan.skippedIncomplete}</strong></div></div>{#if exportDialog.plan.conflicts > 0}<label class="mt-4 block text-xs text-muted" for="strategy">本次所有同名冲突</label><select id="strategy" bind:value={exportDialog.strategy} class="mt-1 h-10 w-full rounded border border-border bg-[#101215] px-3 text-sm"><option value="skip">全部跳过</option><option value="overwrite">全部覆盖</option><option value="rename">全部自动改名</option></select>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => exportDialog = null}>取消</Button><Button variant="primary" on:click={confirmExport}>开始导出</Button></div></Modal>{/if}
 
 {#if existingProjectDialog}<Modal title="项目文件已存在" description={existingProjectDialog.databasePath} on:close={() => existingProjectDialog = null}><div class="space-y-3 text-sm"><div class="rounded-lg border border-border bg-white/5 p-3"><strong class="block">打开并升级</strong><p class="mt-1 text-xs leading-5 text-muted">保留已有标签、扫描记录和项目设置，并自动升级数据库结构。</p></div><div class="rounded-lg border border-danger/30 bg-danger/10 p-3"><strong class="block text-danger">强制覆盖</strong><p class="mt-1 text-xs leading-5 text-muted">删除原项目数据库及其中的标签和索引，再创建空项目；照片目录中的原文件不会被删除。</p></div></div><div class="mt-5 flex flex-wrap justify-end gap-2"><Button variant="ghost" on:click={() => existingProjectDialog = null}>取消</Button><Button on:click={() => resolveExistingProject('upgrade')}>打开并升级</Button><Button variant="danger" on:click={() => resolveExistingProject('overwrite')}>强制覆盖</Button></div></Modal>{/if}
+
+{#if settingsDialog}<Modal title="设置" description="Nini Albums 软件设置" on:close={() => settingsDialog = false}><div class="space-y-4"><label class="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-border bg-white/5 p-3"><div><strong class="block text-sm">自动保存</strong><p class="mt-1 text-xs leading-5 text-muted">标签和隐藏状态始终即时入库。开启后还会定期将 SQLite WAL 完整合并到项目文件。</p></div><input type="checkbox" bind:checked={draftAutoSaveEnabled} class="mt-1 h-4 w-4 accent-[#d9ff5b]" /></label><label class="block"><span class="mb-1.5 block text-xs text-muted">自动保存间隔</span><select bind:value={draftAutoSaveIntervalMinutes} disabled={!draftAutoSaveEnabled} class="h-10 w-full rounded-md border border-border bg-[#101215] px-3 text-sm disabled:opacity-45"><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={30}>每 30 分钟</option></select></label><div class="rounded-lg border border-border p-3 text-xs leading-5 text-muted"><div class="flex justify-between"><span>照片变更检测</span><span class="text-foreground">每 30 秒</span></div><p class="mt-1">只检查支持格式的路径、文件大小和修改时间；发现变化后会提示使用顶部刷新按钮。</p></div></div><div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => settingsDialog = false}>取消</Button><Button variant="primary" on:click={saveSettings}>保存设置</Button></div></Modal>{/if}
 
 <ToastViewport />
 
