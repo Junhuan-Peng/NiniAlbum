@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS project_settings (
   sort_field TEXT NOT NULL DEFAULT 'file_name'
     CHECK (sort_field IN ('file_name','relative_path','modified_time','tagged_status','missing_status')),
   sort_direction TEXT NOT NULL DEFAULT 'asc' CHECK (sort_direction IN ('asc','desc')),
-  schema_version INTEGER NOT NULL DEFAULT 5,
+  schema_version INTEGER NOT NULL DEFAULT 6,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS photo_entries (
   location_group TEXT NULL,
   similarity_group TEXT NULL,
   is_similarity_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_similarity_hidden IN (0,1)),
+  similarity_manual_group TEXT NULL,
   is_trashed INTEGER NOT NULL DEFAULT 0 CHECK (is_trashed IN (0,1)),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -154,6 +155,7 @@ const PHOTO_ENTRY_COLUMNS: &[(&str, &str)] = &[
         "is_similarity_hidden",
         "INTEGER NOT NULL DEFAULT 0 CHECK (is_similarity_hidden IN (0,1))",
     ),
+    ("similarity_manual_group", "TEXT NULL"),
     (
         "is_trashed",
         "INTEGER NOT NULL DEFAULT 0 CHECK (is_trashed IN (0,1))",
@@ -192,7 +194,7 @@ fn migrate(connection: &Connection) -> AppResult<()> {
          CREATE INDEX IF NOT EXISTS idx_photo_trashed ON photo_entries(is_trashed);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_shortcut_key
            ON tag_tree(shortcut_key) WHERE shortcut_key IS NOT NULL;
-         UPDATE project_settings SET schema_version=5 WHERE id=1 AND schema_version<5;",
+         UPDATE project_settings SET schema_version=6 WHERE id=1 AND schema_version<6;",
     )?;
     Ok(())
 }
@@ -219,7 +221,7 @@ pub fn create_project(database_path: &Path, photo_root: &Path) -> AppResult<()> 
     connection.execute_batch(SCHEMA)?;
     migrate(&connection)?;
     connection.execute(
-        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 5)",
+        "INSERT INTO project_settings (id, photo_root, schema_version) VALUES (1, ?1, 6)",
         [photo_root.to_string_lossy().as_ref()],
     )?;
     Ok(())
@@ -434,6 +436,82 @@ pub fn assign_tag(connection: &Connection, photo_id: i64, tag_id: Option<i64>) -
     Ok(())
 }
 
+pub fn assign_tags(
+    connection: &mut Connection,
+    photo_ids: &[i64],
+    tag_id: Option<i64>,
+) -> AppResult<usize> {
+    let transaction = connection.transaction()?;
+    let mut changed = 0;
+    for photo_id in photo_ids {
+        changed += transaction.execute(
+            "UPDATE photo_entries SET tag_id=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2",
+            params![tag_id, photo_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(changed)
+}
+
+pub fn create_manual_similarity_group(
+    connection: &mut Connection,
+    photo_ids: &[i64],
+) -> AppResult<String> {
+    let mut ids = photo_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() < 2 {
+        return Err(AppError::InvalidInput(
+            "至少选择两张照片才能组成相似组".into(),
+        ));
+    }
+    let label: String = connection.query_row(
+        "SELECT '手动组 ' || substr(lower(hex(randomblob(16))),1,8)",
+        [],
+        |row| row.get(0),
+    )?;
+    let transaction = connection.transaction()?;
+    for id in ids {
+        transaction.execute(
+            "UPDATE photo_entries SET similarity_manual_group=?1,similarity_group=?1,
+             is_similarity_hidden=0,updated_at=CURRENT_TIMESTAMP WHERE id=?2",
+            params![label, id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(label)
+}
+
+pub fn remove_from_similarity_group(connection: &Connection, photo_id: i64) -> AppResult<()> {
+    let changed = connection.execute(
+        "UPDATE photo_entries SET similarity_manual_group='',similarity_group=NULL,
+         is_similarity_hidden=0,updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+        [photo_id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::NotFound(format!("照片组 {photo_id}")));
+    }
+    Ok(())
+}
+
+pub fn dissolve_similarity_group(connection: &Connection, photo_id: i64) -> AppResult<usize> {
+    let group: Option<String> = connection.query_row(
+        "SELECT similarity_group FROM photo_entries WHERE id=?1",
+        [photo_id],
+        |row| row.get(0),
+    )?;
+    let Some(group) = group else {
+        return Ok(0);
+    };
+    connection
+        .execute(
+            "UPDATE photo_entries SET similarity_manual_group='',similarity_group=NULL,
+             is_similarity_hidden=0,updated_at=CURRENT_TIMESTAMP WHERE similarity_group=?1",
+            [group],
+        )
+        .map_err(AppError::from)
+}
+
 pub fn set_tag_shortcut(
     connection: &Connection,
     tag_id: i64,
@@ -552,7 +630,7 @@ pub fn list_photos(connection: &Connection, query: &PhotoQuery) -> AppResult<Vec
         (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0) AS modified_time,
         e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
         e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
-        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden,e.is_trashed
+        e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden,e.is_trashed,e.similarity_manual_group
       FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
       WHERE {filter} ORDER BY {}"#,
         order_clause(field, direction)
@@ -602,6 +680,7 @@ fn photo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhotoEntry> {
         similarity_group: row.get(27)?,
         is_similarity_hidden: row.get::<_, i64>(28)? != 0,
         is_trashed: row.get::<_, i64>(29)? != 0,
+        similarity_manual_group: row.get(30)?,
     })
 }
 
@@ -625,7 +704,7 @@ pub fn similarity_photos(connection: &Connection, photo_id: i64) -> AppResult<Ve
           (SELECT MAX(modified_time) FROM photo_files WHERE photo_entry_id=e.id AND is_missing=0),
           e.thumbnail_blob,e.thumbnail_mime,e.pixel_width,e.pixel_height,e.orientation,e.captured_at,
           e.camera_make,e.camera_model,e.lens_model,e.exposure_time,e.aperture,e.iso,e.focal_length,
-          e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden,e.is_trashed
+          e.latitude,e.longitude,e.date_group,e.location_group,e.similarity_group,e.is_similarity_hidden,e.is_trashed,e.similarity_manual_group
         FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id
         WHERE e.similarity_group=?1 AND e.is_trashed=?2 ORDER BY e.captured_at,e.id"#,
     )?;
@@ -767,6 +846,7 @@ mod tests {
         assert!(columns.contains("similarity_group"));
         assert!(columns.contains("is_similarity_hidden"));
         assert!(columns.contains("is_trashed"));
+        assert!(columns.contains("similarity_manual_group"));
         let tag_columns = connection
             .prepare("PRAGMA table_info(tag_tree)")
             .unwrap()
@@ -780,7 +860,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -836,6 +916,69 @@ mod tests {
                 .unwrap()
                 .is_similarity_hidden
         );
+    }
+
+    #[test]
+    fn batch_tags_and_manual_similarity_corrections_are_persisted() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO project_settings(id,photo_root,schema_version) VALUES(1,'/tmp',6)",
+                [],
+            )
+            .unwrap();
+        let tag_id = create_tag(&connection, None, "精选").unwrap();
+        connection
+            .execute(
+                "INSERT INTO photo_entries(relative_dir,pairing_key,display_base_name,similarity_group)
+                 VALUES('','one','ONE','自动组'),('','two','TWO','自动组'),('','three','THREE',NULL)",
+                [],
+            )
+            .unwrap();
+        let ids = connection
+            .prepare("SELECT id FROM photo_entries ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            assign_tags(&mut connection, &ids[..2], Some(tag_id)).unwrap(),
+            2
+        );
+        let tagged: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM photo_entries WHERE tag_id=?1",
+                [tag_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tagged, 2);
+        assert_eq!(assign_tags(&mut connection, &ids[..2], None).unwrap(), 2);
+
+        let manual = create_manual_similarity_group(&mut connection, &[ids[0], ids[2]]).unwrap();
+        let members: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM photo_entries WHERE similarity_manual_group=?1 AND similarity_group=?1",
+                [&manual],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 2);
+
+        remove_from_similarity_group(&connection, ids[0]).unwrap();
+        let removed: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT similarity_group,similarity_manual_group FROM photo_entries WHERE id=?1",
+                [ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(removed, (None, Some(String::new())));
+
+        assert_eq!(dissolve_similarity_group(&connection, ids[2]).unwrap(), 1);
     }
 
     #[test]

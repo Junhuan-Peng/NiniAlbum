@@ -49,6 +49,7 @@ export interface PhotoEntry {
   similarityGroup: string | null;
   isSimilarityHidden: boolean;
   isTrashed: boolean;
+  similarityManualGroup: string | null;
 }
 
 export interface ProjectCounts { total: number; tagged: number; missing: number; conflicts: number; incomplete: number; trashed: number; }
@@ -63,7 +64,8 @@ export interface ScanSummary {
 export interface ScanProgress { phase: 'discovering' | 'fingerprinting' | 'thumbnails' | 'database' | 'complete'; completed: number; total: number; message: string; }
 
 export interface DeleteImpact { tagCount: number; affectedPhotos: number; }
-export interface ExportPlan { eligible: number; conflicts: number; skippedUntagged: number; skippedIncomplete: number; skippedMissing: number; }
+export interface ExportPreviewItem { photoId: number; name: string; tagPath: string | null; status: 'ready' | 'conflict' | 'untagged' | 'incomplete' | 'missing' | 'trashed'; detail: string; }
+export interface ExportPlan { eligible: number; conflicts: number; skippedUntagged: number; skippedIncomplete: number; skippedMissing: number; items: ExportPreviewItem[]; }
 export interface ExportFailure { photoId: number; name: string; reason: string; }
 export interface ExportSummary {
   succeeded: number; skipped: number; renamed: number; failed: number; skippedUntagged: number;

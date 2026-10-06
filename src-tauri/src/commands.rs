@@ -151,6 +151,43 @@ pub fn assign_tag(
 }
 
 #[tauri::command]
+pub fn assign_tags(
+    state: State<'_, AppState>,
+    photo_ids: Vec<i64>,
+    tag_id: Option<i64>,
+) -> Result<usize, String> {
+    let mut connection = db::connect(&state.project_path().command()?).command()?;
+    db::assign_tags(&mut connection, &photo_ids, tag_id).command()
+}
+
+#[tauri::command]
+pub fn create_manual_similarity_group(
+    state: State<'_, AppState>,
+    photo_ids: Vec<i64>,
+) -> Result<String, String> {
+    let mut connection = db::connect(&state.project_path().command()?).command()?;
+    db::create_manual_similarity_group(&mut connection, &photo_ids).command()
+}
+
+#[tauri::command]
+pub fn remove_from_similarity_group(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<(), String> {
+    let connection = db::connect(&state.project_path().command()?).command()?;
+    db::remove_from_similarity_group(&connection, photo_id).command()
+}
+
+#[tauri::command]
+pub fn dissolve_similarity_group(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<usize, String> {
+    let connection = db::connect(&state.project_path().command()?).command()?;
+    db::dissolve_similarity_group(&connection, photo_id).command()
+}
+
+#[tauri::command]
 pub fn set_tag_shortcut(
     state: State<'_, AppState>,
     tag_id: i64,

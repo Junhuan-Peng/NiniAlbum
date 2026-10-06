@@ -774,12 +774,13 @@ fn refresh_smart_groups(transaction: &Transaction<'_>) -> AppResult<()> {
     transaction.execute(
         "UPDATE photo_entries SET date_group=CASE WHEN captured_at IS NULL THEN NULL ELSE substr(captured_at,1,10) END,
          location_group=CASE WHEN latitude IS NULL OR longitude IS NULL THEN NULL ELSE printf('%.2f, %.2f',latitude,longitude) END,
-         similarity_group=NULL",
+         similarity_group=CASE WHEN similarity_manual_group IS NULL THEN NULL ELSE similarity_group END",
         [],
     )?;
     let mut statement = transaction.prepare(
         "SELECT id,captured_at,perceptual_hash FROM photo_entries
          WHERE is_missing=0 AND captured_at IS NOT NULL AND perceptual_hash IS NOT NULL
+           AND similarity_manual_group IS NULL
          ORDER BY captured_at,id",
     )?;
     let photos = statement
@@ -798,13 +799,15 @@ fn refresh_smart_groups(transaction: &Transaction<'_>) -> AppResult<()> {
         let label = format!("相似组 {group_number:03}");
         for id in &ids {
             transaction.execute(
-                "UPDATE photo_entries SET similarity_group=?1 WHERE id=?2",
+                "UPDATE photo_entries SET similarity_group=?1 WHERE id=?2 AND similarity_manual_group IS NULL",
                 params![label, id],
             )?;
         }
     }
     transaction.execute(
-        "UPDATE photo_entries SET is_similarity_hidden=0 WHERE similarity_group IS NULL",
+        "UPDATE photo_entries SET similarity_group=NULL,is_similarity_hidden=0
+         WHERE similarity_manual_group='';
+         UPDATE photo_entries SET is_similarity_hidden=0 WHERE similarity_group IS NULL",
         [],
     )?;
     Ok(())

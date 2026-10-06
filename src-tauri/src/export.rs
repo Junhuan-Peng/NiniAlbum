@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -9,7 +10,7 @@ use rusqlite::Connection;
 use crate::{
     db,
     error::{AppError, AppResult},
-    models::{ExportFailure, ExportPlan, ExportSummary},
+    models::{ExportFailure, ExportPlan, ExportPreviewItem, ExportSummary},
 };
 
 #[derive(Debug, Clone)]
@@ -200,6 +201,69 @@ fn skip_counts(connection: &Connection) -> AppResult<(usize, usize, usize)> {
         .map_err(AppError::from)
 }
 
+fn export_preview_items(
+    connection: &Connection,
+    export_root: &Path,
+    eligible: &[ExportItem],
+) -> AppResult<Vec<ExportPreviewItem>> {
+    let eligible_by_id = eligible
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE paths(id,path) AS (
+           SELECT id,name FROM tag_tree WHERE parent_id IS NULL
+           UNION ALL SELECT t.id,paths.path || '>' || t.name FROM tag_tree t JOIN paths ON t.parent_id=paths.id
+         )
+         SELECT e.id,e.display_base_name,paths.path,e.pair_status,e.is_missing,e.is_trashed
+         FROM photo_entries e LEFT JOIN paths ON paths.id=e.tag_id ORDER BY e.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)? != 0,
+            row.get::<_, i64>(5)? != 0,
+        ))
+    })?;
+    let mut preview = Vec::new();
+    for row in rows {
+        let (id, name, tag_path, pair_status, missing, trashed) = row?;
+        let (status, detail) = if trashed {
+            ("trashed", "位于回收站，不导出".into())
+        } else if missing {
+            ("missing", "源文件丢失".into())
+        } else if tag_path.is_none() {
+            ("untagged", "尚未标注标签".into())
+        } else if pair_status != "complete" {
+            ("incomplete", format!("配对状态：{pair_status}"))
+        } else if let Some(item) = eligible_by_id.get(&id) {
+            let directory = target_directory(export_root, &item.tag_path);
+            let targets = original_targets(&directory, item);
+            let conflict = has_conflict(&targets);
+            let relative = format!(
+                "{} / {} + {}",
+                item.tag_path.replace('>', " / "),
+                item.jpeg.original_name,
+                item.raw.original_name
+            );
+            (if conflict { "conflict" } else { "ready" }, relative)
+        } else {
+            ("incomplete", "缺少可导出的 JPEG/ARW 文件".into())
+        };
+        preview.push(ExportPreviewItem {
+            photo_id: id,
+            name,
+            tag_path,
+            status: status.into(),
+            detail,
+        });
+    }
+    Ok(preview)
+}
+
 pub fn plan_export(database_path: &Path, export_root: &Path) -> AppResult<ExportPlan> {
     let connection = db::connect(database_path)?;
     let items = export_items(&connection)?;
@@ -213,12 +277,14 @@ pub fn plan_export(database_path: &Path, export_root: &Path) -> AppResult<Export
             ))
         })
         .count();
+    let preview_items = export_preview_items(&connection, export_root, &items)?;
     Ok(ExportPlan {
         eligible: items.len(),
         conflicts,
         skipped_untagged: untagged,
         skipped_incomplete: incomplete,
         skipped_missing: missing,
+        items: preview_items,
     })
 }
 

@@ -53,6 +53,7 @@ pub struct PhotoEntry {
     pub similarity_group: Option<String>,
     pub is_similarity_hidden: bool,
     pub is_trashed: bool,
+    pub similarity_manual_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -130,6 +131,17 @@ pub struct ExportPlan {
     pub skipped_untagged: usize,
     pub skipped_incomplete: usize,
     pub skipped_missing: usize,
+    pub items: Vec<ExportPreviewItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreviewItem {
+    pub photo_id: i64,
+    pub name: String,
+    pub tag_path: Option<String>,
+    pub status: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
