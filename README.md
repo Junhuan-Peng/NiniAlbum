@@ -2,6 +2,8 @@
 
 本地 JPEG + Sony ARW 层级标签标注与导出工具。应用使用 Tauri v2、Svelte 4、Rust 和 SQLite 构建，不上传或修改源照片。
 
+支持单张或批量分配/取消标签、手动组成和修正相似照片组，以及在实际复制前逐项预览导出结果与冲突。
+
 ## 开发
 
 环境要求：Node.js 20+、Rust stable，以及当前平台的 Tauri v2 系统依赖。

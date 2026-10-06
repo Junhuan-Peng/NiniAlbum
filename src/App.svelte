@@ -39,6 +39,8 @@
   let smartKind: 'none' | 'date' | 'location' = 'none';
   let smartGroup = '';
   let selectedPhotoId: number | null = null;
+  let selectedPhotoIds = new Set<number>();
+  let selectionAnchorIndex: number | null = null;
   let similarPhotos: PhotoEntry[] = [];
   let similarLoading = false;
   let similarityRequest = 0;
@@ -72,6 +74,7 @@
     ?? null;
   $: currentListIndex = currentPhoto ? photos.findIndex((photo) => photo.id === currentPhoto.id) : -1;
   $: hiddenSimilarityCount = sourcePhotos.filter((photo) => photo.isSimilarityHidden).length;
+  $: selectedPhotoCount = selectedPhotoIds.size;
   $: roots = (snapshot?.tags ?? []).filter((tag) => tag.parentId === null);
   $: selectedTag = snapshot?.tags.find((tag) => tag.id === selectedTagId) ?? null;
   $: scanPercent = scanProgress && scanProgress.total > 0
@@ -216,6 +219,7 @@
   }
 
   async function changeSmartKind() {
+    clearPhotoSelection();
     smartGroup = '';
     selectedIndex = 0;
     await tick();
@@ -224,6 +228,7 @@
   }
 
   async function changeSmartGroup() {
+    clearPhotoSelection();
     selectedIndex = 0;
     await tick();
     selectedPhotoId = photos[0]?.id ?? null;
@@ -363,6 +368,40 @@
     await Promise.all([loadSimilarityPhotos(selectedPhotoId), loadPreview(currentPhoto)]);
   }
 
+  function setPhotoSelection(ids: Iterable<number>) {
+    selectedPhotoIds = new Set(ids);
+  }
+
+  function togglePhotoSelection(index: number, range = false) {
+    if (index < 0 || index >= photos.length) return;
+    const next = new Set(selectedPhotoIds);
+    if (range && selectionAnchorIndex !== null) {
+      const [start, end] = [selectionAnchorIndex, index].sort((a, b) => a - b);
+      for (let cursor = start; cursor <= end; cursor += 1) next.add(photos[cursor].id);
+    } else if (next.has(photos[index].id)) next.delete(photos[index].id);
+    else next.add(photos[index].id);
+    selectionAnchorIndex = index;
+    selectedPhotoIds = next;
+  }
+
+  async function handlePhotoClick(index: number, event: MouseEvent) {
+    if (event.shiftKey || event.metaKey || event.ctrlKey) {
+      togglePhotoSelection(index, event.shiftKey);
+    } else {
+      selectionAnchorIndex = index;
+    }
+    await choosePhoto(index);
+  }
+
+  function selectAllPhotos() {
+    setPhotoSelection(photos.map((photo) => photo.id));
+  }
+
+  function clearPhotoSelection() {
+    setPhotoSelection([]);
+    selectionAnchorIndex = null;
+  }
+
   async function loadSimilarityPhotos(photoId: number | null) {
     const request = ++similarityRequest;
     if (photoId === null) { similarPhotos = []; return; }
@@ -408,12 +447,55 @@
     if (!currentPhoto) return;
     selectedTagId = tagId;
     const photoId = currentPhoto.id;
+    const targets = selectedPhotoIds.size ? [...selectedPhotoIds] : [photoId];
+    const batch = targets.length > 1;
     const nextPhotoId = currentListIndex >= 0
       ? photos[currentListIndex + 1]?.id ?? (filter === 'untagged' ? photos[currentListIndex - 1]?.id ?? photoId : photoId)
       : photoId;
     try {
-      await api.assignTag(photoId, tagId);
-      await refresh(advance ? nextPhotoId : photoId);
+      await api.assignTags(targets, tagId);
+      if (selectedPhotoIds.size) clearPhotoSelection();
+      await refresh(advance && !batch ? nextPhotoId : photoId);
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function clearAssignedTags() {
+    if (!currentPhoto) return;
+    const targets = selectedPhotoIds.size ? [...selectedPhotoIds] : [currentPhoto.id];
+    const preserveId = currentPhoto.id;
+    try {
+      await api.assignTags(targets, null);
+      clearPhotoSelection();
+      await refresh(preserveId);
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function createManualSimilarityGroup() {
+    const ids = [...selectedPhotoIds];
+    if (ids.length < 2) { toast('请先批量选择至少两张照片。'); return; }
+    try {
+      await api.createManualSimilarityGroup(ids);
+      const preserveId = currentPhoto?.id ?? ids[0];
+      clearPhotoSelection();
+      await refresh(preserveId);
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function removeCurrentFromSimilarityGroup() {
+    if (!currentPhoto?.similarityGroup) return;
+    try {
+      const photoId = currentPhoto.id;
+      await api.removeFromSimilarityGroup(photoId);
+      await refresh(photoId);
+    } catch (error) { toast(errorMessage(error), 'error'); }
+  }
+
+  async function dissolveCurrentSimilarityGroup() {
+    if (!currentPhoto?.similarityGroup || !confirm(`解散“${currentPhoto.similarityGroup}”？组内照片将不再自动重新合并。`)) return;
+    try {
+      const photoId = currentPhoto.id;
+      await api.dissolveSimilarityGroup(photoId);
+      await refresh(photoId);
     } catch (error) { toast(errorMessage(error), 'error'); }
   }
 
@@ -455,6 +537,7 @@
   }
 
   async function toggleTrashView() {
+    clearPhotoSelection();
     filter = filter === 'trash' ? 'all' : 'trash';
     smartKind = 'none'; smartGroup = ''; selectedIndex = 0;
     await runBusy(filter === 'trash' ? '正在打开回收站…' : '正在返回照片列表…', async () => refresh(null));
@@ -487,6 +570,7 @@
 
   async function updateQuery() {
     if (!snapshot) return;
+    clearPhotoSelection();
     if (filter === 'trash') { smartKind = 'none'; smartGroup = ''; }
     await runBusy('正在更新列表…', async () => { await api.saveSort(sortField, sortDirection); await refresh(); });
   }
@@ -668,12 +752,25 @@
           <div class="flex gap-1"><select bind:value={sortField} on:change={updateQuery} class="h-8 min-w-0 flex-1 rounded border border-border bg-[#111316] px-2 text-xs"><option value="file_name">文件名</option><option value="relative_path">相对路径</option><option value="modified_time">修改时间</option><option value="tagged_status">标注状态</option><option value="missing_status">缺失状态</option></select><button class="h-8 w-9 rounded border border-border bg-[#111316] text-xs" on:click={() => { sortDirection = sortDirection === 'asc' ? 'desc' : 'asc'; updateQuery(); }} aria-label="切换排序方向">{sortDirection === 'asc' ? '↑' : '↓'}</button></div>
           <div class="rounded-lg border border-border bg-black/10 p-1.5"><label class="mb-1 block px-0.5 text-[9px] font-semibold uppercase tracking-widest text-muted" for="smart-kind">智能分类</label><select id="smart-kind" bind:value={smartKind} on:change={changeSmartKind} class="h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="none">不筛选</option><option value="date">拍摄日期</option><option value="location">地理坐标</option></select>{#if smartKind !== 'none'}<select bind:value={smartGroup} on:change={changeSmartGroup} class="mt-1 h-8 w-full rounded border border-border bg-[#111316] px-2 text-xs"><option value="">全部有数据的照片</option>{#each smartOptions as option}<option value={option}>{option}</option>{/each}</select>{#if smartOptions.length === 0}<p class="px-1 pt-1.5 text-[10px] text-muted">暂无数据，请重新扫描照片。</p>{/if}{/if}</div>
         </div>
+        <div class="flex min-h-10 items-center gap-1 border-b border-border px-2 py-1.5 text-[10px]">
+          <button class="rounded border border-border px-2 py-1.5 text-muted hover:border-accent/40 hover:text-foreground" on:click={selectAllPhotos}>全选</button>
+          {#if selectedPhotoCount > 0}
+            <span class="ml-1 whitespace-nowrap text-accent">已选 {selectedPhotoCount} 张</span>
+            <button class="ml-auto rounded border border-border px-2 py-1.5 text-muted hover:border-accent/40 hover:text-foreground disabled:opacity-40" disabled={selectedPhotoCount < 2} on:click={createManualSimilarityGroup}>组成相似组</button>
+            <button class="rounded px-2 py-1.5 text-muted hover:bg-white/5 hover:text-foreground" on:click={clearPhotoSelection}>清空</button>
+          {:else}
+            <span class="ml-1 text-muted">⌘/Ctrl 单选 · Shift 连选</span>
+          {/if}
+        </div>
         <div class="min-h-0 flex-1 overflow-y-auto p-1.5">
           {#each photos as photo, index (photo.id)}
-            <button class:active={photo.id === currentPhoto?.id} class="mb-1 flex min-h-[88px] w-full items-center gap-3 rounded-lg border border-transparent p-2 text-left hover:bg-white/5" on:click={() => choosePhoto(index)}>
-              <div class="grid shrink-0 place-items-center overflow-hidden rounded-md bg-[#0d0e10] text-[10px] text-muted shadow-sm" style={thumbnailStyle(photo)}>{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt="" class="h-full w-full object-cover" />{:else}{photo.isMissing ? '丢失' : photo.pairStatus === 'conflict' ? '冲突' : 'RAW'}{/if}</div>
-              <div class="min-w-0 flex-1 py-0.5"><div class="truncate text-xs font-medium">{photo.displayBaseName}</div><div class="mt-1 truncate text-[10px] text-muted">{photo.relativeDir || '根目录'}</div><div class="mt-1 flex items-center gap-1 text-[9px]">{#if photo.isTrashed}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">待删除</span>{:else if photo.isMissing}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">丢失</span>{:else if photo.pairStatus === 'conflict'}<span class="rounded bg-amber-400/15 px-1.5 py-0.5 text-amber-300">冲突</span>{:else if photo.pairStatus !== 'complete'}<span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-sky-300">缺配对</span>{/if}{#if photo.tagId}<span class="truncate rounded bg-accent/10 px-1.5 py-0.5 text-accent">{photo.tagPath}</span>{/if}</div></div>
-            </button>
+            <div class:active={photo.id === currentPhoto?.id} class:batch-selected={selectedPhotoIds.has(photo.id)} class="mb-1 flex min-h-[88px] w-full items-center rounded-lg border border-transparent hover:bg-white/5">
+              <button class="ml-1.5 grid h-5 w-5 shrink-0 place-items-center rounded border text-[11px] font-bold" class:border-accent={selectedPhotoIds.has(photo.id)} class:bg-accent={selectedPhotoIds.has(photo.id)} class:text-black={selectedPhotoIds.has(photo.id)} class:border-border={!selectedPhotoIds.has(photo.id)} class:text-muted={!selectedPhotoIds.has(photo.id)} aria-label={`${selectedPhotoIds.has(photo.id) ? '取消选择' : '选择'} ${photo.displayBaseName}`} on:click|stopPropagation={() => { togglePhotoSelection(index); choosePhoto(index); }}>{selectedPhotoIds.has(photo.id) ? '✓' : ''}</button>
+              <button class="flex min-w-0 flex-1 items-center gap-3 p-2 text-left" on:click={(event) => handlePhotoClick(index, event)}>
+                <div class="grid shrink-0 place-items-center overflow-hidden rounded-md bg-[#0d0e10] text-[10px] text-muted shadow-sm" style={thumbnailStyle(photo)}>{#if photo.thumbnailDataUrl}<img src={photo.thumbnailDataUrl} alt="" class="h-full w-full object-cover" />{:else}{photo.isMissing ? '丢失' : photo.pairStatus === 'conflict' ? '冲突' : 'RAW'}{/if}</div>
+                <div class="min-w-0 flex-1 py-0.5"><div class="truncate text-xs font-medium">{photo.displayBaseName}</div><div class="mt-1 truncate text-[10px] text-muted">{photo.relativeDir || '根目录'}</div><div class="mt-1 flex items-center gap-1 text-[9px]">{#if photo.isTrashed}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">待删除</span>{:else if photo.isMissing}<span class="rounded bg-danger/15 px-1.5 py-0.5 text-danger">丢失</span>{:else if photo.pairStatus === 'conflict'}<span class="rounded bg-amber-400/15 px-1.5 py-0.5 text-amber-300">冲突</span>{:else if photo.pairStatus !== 'complete'}<span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-sky-300">缺配对</span>{/if}{#if photo.tagId}<span class="truncate rounded bg-accent/10 px-1.5 py-0.5 text-accent">{photo.tagPath}</span>{/if}</div></div>
+              </button>
+            </div>
           {:else}<div class="p-5 text-center text-xs text-muted">当前筛选没有照片</div>{/each}
         </div>
       </aside>
@@ -688,7 +785,7 @@
         </div>
         {#if similarLoading || similarPhotos.length > 1}
           <aside class="flex w-44 shrink-0 flex-col border-l border-border bg-[#121417]">
-            <div class="border-b border-border px-3 py-2"><div class="text-[10px] font-semibold uppercase tracking-[.16em] text-muted">相似照片</div><div class="mt-0.5 text-xs">{similarPhotos.length} 张{#if similarPhotos.some((photo) => photo.isSimilarityHidden)} · {similarPhotos.filter((photo) => photo.isSimilarityHidden).length} 张已隐藏{/if}</div></div>
+            <div class="border-b border-border px-3 py-2"><div class="text-[10px] font-semibold uppercase tracking-[.16em] text-muted">相似照片</div><div class="mt-0.5 text-xs">{similarPhotos.length} 张{#if similarPhotos.some((photo) => photo.isSimilarityHidden)} · {similarPhotos.filter((photo) => photo.isSimilarityHidden).length} 张已隐藏{/if}</div><div class="mt-2 grid grid-cols-2 gap-1"><button class="rounded border border-border px-1 py-1 text-[9px] text-muted hover:border-accent/40 hover:text-foreground" on:click={removeCurrentFromSimilarityGroup}>移出当前</button><button class="rounded border border-border px-1 py-1 text-[9px] text-muted hover:border-danger/50 hover:text-danger" on:click={dissolveCurrentSimilarityGroup}>解散整组</button></div></div>
             <div class="min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
               {#if similarLoading}<div class="py-6 text-center text-[10px] text-muted">正在加载…</div>{/if}
               {#each similarPhotos as photo (photo.id)}
@@ -721,7 +818,7 @@
             </div>
           {:else}<p class="px-3 pb-3 text-[10px] text-muted">选择照片后显示 EXIF。</p>{/if}
         </details>
-        <div class="flex flex-wrap gap-1 border-b border-border p-2"><Button size="sm" on:click={() => startTagDialog('root')}>＋根标签</Button><Button size="sm" disabled={!selectedTag} on:click={() => startTagDialog('child')}>＋子标签</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={() => startTagDialog('rename')}>重命名</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={openShortcutDialog}>快捷键</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={inspectDelete}>删除</Button></div>
+        <div class="flex flex-wrap gap-1 border-b border-border p-2"><Button size="sm" on:click={() => startTagDialog('root')}>＋根标签</Button><Button size="sm" disabled={!selectedTag} on:click={() => startTagDialog('child')}>＋子标签</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={() => startTagDialog('rename')}>重命名</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={openShortcutDialog}>快捷键</Button><Button size="sm" variant="ghost" disabled={!selectedTag} on:click={inspectDelete}>删除</Button><Button size="sm" variant="ghost" disabled={!currentPhoto || (selectedPhotoCount === 0 && !currentPhoto.tagId)} on:click={clearAssignedTags}>取消标签{selectedPhotoCount ? ` (${selectedPhotoCount})` : ''}</Button></div>
         <div class="min-h-0 flex-1 overflow-y-auto py-2">{#each roots as root (root.id)}<TagBranch tag={root} tags={snapshot.tags} selectedId={selectedTagId} assignedId={currentPhoto?.tagId ?? null} onSelect={(id) => assignSelectedTag(id)} />{:else}<div class="p-5 text-center text-xs text-muted">创建第一个层级标签</div>{/each}</div>
         <div class="border-t border-border p-3 text-[10px] leading-5 text-muted">单击立即分配 · 1–9 分配并前进<br />空格重复分配并前进 · ↑ ↓ 切换照片</div>
       </aside>
@@ -738,7 +835,7 @@
 
 {#if deleteDialog}<Modal title="删除标签" description={`将删除“${deleteDialog.tag.name}”及其 ${deleteDialog.impact.tagCount - 1} 个子标签。`} on:close={() => deleteDialog = null}>{#if deleteDialog.impact.affectedPhotos > 0}<p class="rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm">标签子树正在被 <strong>{deleteDialog.impact.affectedPhotos}</strong> 张照片使用。请选择取消，或先将这些照片设为未标记再删除。</p>{:else}<p class="text-sm text-muted">该标签子树没有照片引用，可以安全删除。</p>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => deleteDialog = null}>不删除</Button><Button variant="danger" on:click={confirmDelete}>{deleteDialog.impact.affectedPhotos > 0 ? '取消标记并删除' : '确认删除'}</Button></div></Modal>{/if}
 
-{#if exportDialog}<Modal title="确认批量导出" description={`将导出到 ${exportDialog.root}`} on:close={() => exportDialog = null}><div class="grid grid-cols-2 gap-2 text-sm"><div class="rounded bg-white/5 p-3">可导出 <strong class="float-right text-accent">{exportDialog.plan.eligible}</strong></div><div class="rounded bg-white/5 p-3">同名冲突 <strong class="float-right text-amber-300">{exportDialog.plan.conflicts}</strong></div><div class="rounded bg-white/5 p-3">未标记 <strong class="float-right">{exportDialog.plan.skippedUntagged}</strong></div><div class="rounded bg-white/5 p-3">缺失/不完整 <strong class="float-right">{exportDialog.plan.skippedMissing + exportDialog.plan.skippedIncomplete}</strong></div></div>{#if exportDialog.plan.conflicts > 0}<label class="mt-4 block text-xs text-muted" for="strategy">本次所有同名冲突</label><select id="strategy" bind:value={exportDialog.strategy} class="mt-1 h-10 w-full rounded border border-border bg-[#101215] px-3 text-sm"><option value="skip">全部跳过</option><option value="overwrite">全部覆盖</option><option value="rename">全部自动改名</option></select>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => exportDialog = null}>取消</Button><Button variant="primary" on:click={confirmExport}>开始导出</Button></div></Modal>{/if}
+{#if exportDialog}<Modal title="导出前预览" description={`将导出到 ${exportDialog.root}`} on:close={() => exportDialog = null}><div class="grid grid-cols-2 gap-2 text-sm"><div class="rounded bg-white/5 p-3">可导出 <strong class="float-right text-accent">{exportDialog.plan.eligible}</strong></div><div class="rounded bg-white/5 p-3">同名冲突 <strong class="float-right text-amber-300">{exportDialog.plan.conflicts}</strong></div><div class="rounded bg-white/5 p-3">未标记 <strong class="float-right">{exportDialog.plan.skippedUntagged}</strong></div><div class="rounded bg-white/5 p-3">缺失/不完整 <strong class="float-right">{exportDialog.plan.skippedMissing + exportDialog.plan.skippedIncomplete}</strong></div></div><div class="mt-4 flex items-center justify-between"><span class="text-xs font-medium">照片明细</span><span class="text-[10px] text-muted">共 {exportDialog.plan.items.length} 张</span></div><div class="mt-1 max-h-64 overflow-y-auto rounded-lg border border-border bg-black/10"><div class="sticky top-0 grid grid-cols-[minmax(0,1fr)_74px] border-b border-border bg-[#181b1f] px-3 py-2 text-[9px] uppercase tracking-wider text-muted"><span>照片 / 目标</span><span>处理结果</span></div>{#each exportDialog.plan.items as item (item.photoId)}<div class="grid grid-cols-[minmax(0,1fr)_74px] items-center gap-2 border-b border-border/60 px-3 py-2 last:border-b-0"><div class="min-w-0"><div class="truncate text-xs" title={item.name}>{item.name}</div><div class="mt-0.5 truncate text-[9px] text-muted" title={item.detail}>{item.detail}</div></div><span class:text-accent={item.status === 'ready'} class:text-amber-300={item.status === 'conflict'} class:text-danger={item.status === 'missing'} class="text-[10px]">{item.status === 'ready' ? '可导出' : item.status === 'conflict' ? '同名冲突' : item.status === 'untagged' ? '未标记' : item.status === 'incomplete' ? '配对不完整' : item.status === 'missing' ? '文件丢失' : '回收站'}</span></div>{/each}</div>{#if exportDialog.plan.conflicts > 0}<label class="mt-4 block text-xs text-muted" for="strategy">本次所有同名冲突</label><select id="strategy" bind:value={exportDialog.strategy} class="mt-1 h-10 w-full rounded border border-border bg-[#101215] px-3 text-sm"><option value="skip">全部跳过</option><option value="overwrite">全部覆盖</option><option value="rename">全部自动改名</option></select>{/if}<div class="mt-5 flex justify-end gap-2"><Button variant="ghost" on:click={() => exportDialog = null}>取消</Button><Button variant="primary" on:click={confirmExport}>开始导出</Button></div></Modal>{/if}
 
 {#if existingProjectDialog}<Modal title="项目文件已存在" description={existingProjectDialog.databasePath} on:close={() => existingProjectDialog = null}><div class="space-y-3 text-sm"><div class="rounded-lg border border-border bg-white/5 p-3"><strong class="block">打开并升级</strong><p class="mt-1 text-xs leading-5 text-muted">保留已有标签、扫描记录和项目设置，并自动升级数据库结构。</p></div><div class="rounded-lg border border-danger/30 bg-danger/10 p-3"><strong class="block text-danger">强制覆盖</strong><p class="mt-1 text-xs leading-5 text-muted">删除原项目数据库及其中的标签和索引，再创建空项目；照片目录中的原文件不会被删除。</p></div></div><div class="mt-5 flex flex-wrap justify-end gap-2"><Button variant="ghost" on:click={() => existingProjectDialog = null}>取消</Button><Button on:click={() => resolveExistingProject('upgrade')}>打开并升级</Button><Button variant="danger" on:click={() => resolveExistingProject('overwrite')}>强制覆盖</Button></div></Modal>{/if}
 
@@ -746,4 +843,4 @@
 
 <ToastViewport />
 
-<style>.active { border-color: rgba(217,255,91,.4); background: rgba(217,255,91,.08); }</style>
+<style>.active { border-color: rgba(217,255,91,.4); background: rgba(217,255,91,.08); }.batch-selected { box-shadow: inset 0 0 0 1px rgba(100,180,255,.55); background: rgba(100,180,255,.07); }</style>

@@ -104,7 +104,7 @@ CREATE TABLE project_settings (
     )),
   sort_direction TEXT NOT NULL DEFAULT 'asc'
     CHECK (sort_direction IN ('asc', 'desc')),
-  schema_version INTEGER NOT NULL DEFAULT 5,
+  schema_version INTEGER NOT NULL DEFAULT 6,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -194,6 +194,7 @@ CREATE TABLE photo_entries (
   date_group TEXT NULL,
   location_group TEXT NULL,
   similarity_group TEXT NULL,
+  similarity_manual_group TEXT NULL,
   is_similarity_hidden INTEGER NOT NULL DEFAULT 0
     CHECK (is_similarity_hidden IN (0, 1)),
   is_trashed INTEGER NOT NULL DEFAULT 0
@@ -220,6 +221,7 @@ CREATE INDEX idx_photo_sort_path ON photo_entries(relative_dir);
 - `perceptual_hash` 用于在最长 30 秒的连续拍摄窗口内识别高度相似照片；新成员必须与组内每张照片的哈希距离都不超过阈值，禁止通过 A≈B、B≈C 的关系将实际不相似的 A 与 C 传递合并；命中后写入稳定的 `similarity_group`；
 - 相似组是照片浏览的固有上下文，不属于智能筛选项；选择组内照片时在预览区右侧显示完整组；
 - 用户可将组内照片从主列表隐藏，状态写入 `is_similarity_hidden`。隐藏照片仍可在相似组侧栏查看和恢复，并且每组至少保留一个未隐藏成员作为入口；
+- 用户可以批量选择照片组成手动相似组，也可以将单张照片移出或解散整组；手动修正写入 `similarity_manual_group`，后续重新扫描不得被自动算法覆盖；空字符串表示明确排除自动分组；
 - `is_trashed` 是独立于 `tag_id` 的内置待删除状态；移入回收站时保留原标签，恢复后回到原标签，且绝不删除源文件；
 - 配对状态与丢失状态相互独立，例如历史上完整配对的照片组移动失败后可以是 `complete + is_missing=1`。
 
